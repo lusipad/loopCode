@@ -2,6 +2,7 @@
 #define NOMINMAX
 
 #include <windows.h>
+#include <TlHelp32.h>
 #include <Unknwn.h>
 #include <UIAutomationClient.h>
 #include <UIAutomationCoreApi.h>
@@ -26,6 +27,7 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -91,6 +93,53 @@ std::vector<std::string> split_patterns(const std::string& value) {
         start = pos + 2;
     }
     return parts;
+}
+
+std::string join_patterns(const std::vector<std::string>& values, std::string_view separator = "||") {
+    if (values.empty()) {
+        return "(none)";
+    }
+
+    std::ostringstream builder;
+    bool first = true;
+    for (const auto& value : values) {
+        if (!first) {
+            builder << separator;
+        }
+        builder << value;
+        first = false;
+    }
+    return builder.str();
+}
+
+std::string match_any_substring(const std::string& haystack_lower, const std::vector<std::string>& patterns) {
+    for (const auto& raw_pattern : patterns) {
+        const auto normalized = to_lower_ascii(raw_pattern);
+        if (!normalized.empty() && haystack_lower.find(normalized) != std::string::npos) {
+            return raw_pattern;
+        }
+    }
+    return {};
+}
+
+bool process_name_matches(std::string_view exe_name, const std::vector<std::string>& patterns) {
+    const auto normalized_exe_name = to_lower_ascii(exe_name);
+    for (const auto& raw_pattern : patterns) {
+        auto normalized_pattern = to_lower_ascii(trim(raw_pattern));
+        if (normalized_pattern.empty()) {
+            continue;
+        }
+        if (normalized_exe_name == normalized_pattern) {
+            return true;
+        }
+        if (normalized_pattern.size() < 4 || normalized_pattern.substr(normalized_pattern.size() - 4) != ".exe") {
+            normalized_pattern += ".exe";
+            if (normalized_exe_name == normalized_pattern) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 std::string normalize_line(std::string text) {
@@ -337,8 +386,12 @@ struct Config {
     bool restart_on_exit = true;
     int max_restarts = -1;
     int restart_delay_seconds = 10;
+    std::string attach_strategy = "auto";
+    std::vector<std::string> target_process_names;
+    std::vector<std::string> terminal_process_names;
     std::string window_title_contains;
     std::string window_class_contains;
+    std::vector<std::string> attach_visible_text_patterns;
     int idle_seconds = 240;
     int attach_poll_millis = 1500;
     int action_cooldown_seconds = 45;
@@ -372,8 +425,18 @@ Config load_config(const fs::path& path) {
     config.restart_on_exit = parse_bool(ini.get("agent", "restart_on_exit", "true"), true);
     config.max_restarts = parse_int(ini.get("agent", "max_restarts", "-1"), -1);
     config.restart_delay_seconds = parse_int(ini.get("agent", "restart_delay_seconds", "10"), 10);
+    config.attach_strategy = to_lower_ascii(ini.get("agent", "attach_strategy", "auto"));
+    config.target_process_names =
+        split_patterns(ini.get("agent", "target_process_names", "codex.exe||claude.exe"));
+    config.terminal_process_names =
+        split_patterns(ini.get("agent", "terminal_process_names", "WindowsTerminal.exe||OpenConsole.exe||conhost.exe"));
     config.window_title_contains = ini.get("agent", "window_title_contains", "");
     config.window_class_contains = ini.get("agent", "window_class_contains", "");
+    config.attach_visible_text_patterns = split_patterns(
+        ini.get("agent",
+                "attach_visible_text_contains",
+                "codex||claude||openai||anthropic||continue||继续||approval||confirm||network||timeout||rate limit||"
+                "service unavailable||thinking||working"));
 
     config.idle_seconds = parse_int(ini.get("watchdog", "idle_seconds", "240"), 240);
     config.attach_poll_millis = parse_int(ini.get("watchdog", "attach_poll_millis", "1500"), 1500);
@@ -410,8 +473,32 @@ Config load_config(const fs::path& path) {
         throw std::runtime_error("Config key [agent] command_line is required.");
     }
 
-    if (config.mode == "attach" && config.window_title_contains.empty() && config.window_class_contains.empty()) {
-        throw std::runtime_error("Attach mode requires [agent] window_title_contains or window_class_contains.");
+    if (config.mode == "attach") {
+        const bool has_title_filters = !config.window_title_contains.empty() || !config.window_class_contains.empty();
+        const bool has_process_tree_filters = !config.target_process_names.empty() && !config.terminal_process_names.empty();
+
+        if (config.attach_strategy != "auto" && config.attach_strategy != "process_tree" &&
+            config.attach_strategy != "title_match") {
+            throw std::runtime_error(
+                "Config key [agent] attach_strategy must be auto, process_tree, or title_match.");
+        }
+
+        if (config.attach_strategy == "title_match" && !has_title_filters) {
+            throw std::runtime_error(
+                "Attach mode with attach_strategy=title_match requires [agent] window_title_contains or "
+                "window_class_contains.");
+        }
+
+        if (config.attach_strategy == "process_tree" && !has_process_tree_filters) {
+            throw std::runtime_error(
+                "Attach mode with attach_strategy=process_tree requires [agent] target_process_names and "
+                "terminal_process_names.");
+        }
+
+        if (config.attach_strategy == "auto" && !has_process_tree_filters && !has_title_filters) {
+            throw std::runtime_error(
+                "Attach mode requires either process-tree settings or title/class filters.");
+        }
     }
 
     return config;
@@ -471,6 +558,7 @@ struct RuntimeOptions {
     fs::path config_path = "examples/loopguard.ini";
     bool resume_last = false;
     std::optional<std::string> resume_session_name;
+    std::optional<std::string> self_test_name;
 };
 
 struct SavedSessionData {
@@ -510,14 +598,14 @@ public:
 
         const auto haystack = to_lower_ascii(text);
         refresh_suppression_locked(haystack);
-        if (const auto matched = match_any(haystack, config.recoverable_error_patterns); !matched.empty()) {
+        if (const auto matched = match_any_substring(haystack, config.recoverable_error_patterns); !matched.empty()) {
             const auto key = "recoverable:" + to_lower_ascii(matched);
             if (suppressed_trigger_key_ != key) {
                 queue_locked({TriggerKind::Continue, "matched recoverable_error pattern: " + matched, 2});
             }
             return;
         }
-        if (const auto matched = match_any(haystack, config.wait_patterns); !matched.empty()) {
+        if (const auto matched = match_any_substring(haystack, config.wait_patterns); !matched.empty()) {
             const auto key = "wait:" + to_lower_ascii(matched);
             if (suppressed_trigger_key_ != key) {
                 queue_locked({TriggerKind::Continue, "matched wait pattern: " + matched, 1});
@@ -541,7 +629,7 @@ public:
         queue_locked({TriggerKind::RestartResume, reason, 3, transcript});
     }
 
-    std::optional<PendingAction> pop_due_action(const Config& config) {
+    std::optional<PendingAction> pop_due_action(const Config& config, bool allow_idle = true) {
         std::lock_guard<std::mutex> lock(mutex_);
         const auto now = Clock::now();
 
@@ -552,7 +640,7 @@ public:
             return action;
         }
 
-        if (config.idle_seconds > 0 &&
+        if (allow_idle && config.idle_seconds > 0 &&
             seconds_since_locked(last_activity_, now) >= config.idle_seconds &&
             seconds_since_locked(last_action_, now) >= config.action_cooldown_seconds) {
             last_activity_ = now;
@@ -592,16 +680,6 @@ private:
         while (transcript_.size() > keep_lines_) {
             transcript_.pop_front();
         }
-    }
-
-    std::string match_any(const std::string& haystack, const std::vector<std::string>& patterns) const {
-        for (const auto& raw_pattern : patterns) {
-            const auto normalized = to_lower_ascii(raw_pattern);
-            if (!normalized.empty() && haystack.find(normalized) != std::string::npos) {
-                return raw_pattern;
-            }
-        }
-        return {};
     }
 
     void queue_locked(PendingAction next) {
@@ -781,6 +859,18 @@ struct WindowInfo {
     DWORD pid = 0;
     std::string title;
     std::string class_name;
+    std::string selection_reason;
+};
+
+struct ProcessInfo {
+    DWORD pid = 0;
+    DWORD parent_pid = 0;
+    std::string exe_name;
+};
+
+struct ProcessTreeResolution {
+    std::vector<DWORD> target_pids;
+    std::unordered_set<DWORD> terminal_pids;
 };
 
 struct AttachSession {
@@ -788,8 +878,34 @@ struct AttachSession {
     std::string title;
     std::string class_name;
     std::string last_snapshot;
+    bool snapshot_confirmed = false;
+    std::string snapshot_confirmation_reason;
+    bool unconfirmed_logged = false;
     bool missing_logged = false;
 };
+
+bool has_title_filters(const Config& config) {
+    return !config.window_title_contains.empty() || !config.window_class_contains.empty();
+}
+
+std::string attach_snapshot_confirmation_reason(const std::string& snapshot, const Config& config) {
+    if (snapshot.empty()) {
+        return {};
+    }
+
+    const auto haystack = to_lower_ascii(snapshot);
+    if (const auto matched = match_any_substring(haystack, config.wait_patterns); !matched.empty()) {
+        return "wait pattern: " + matched;
+    }
+    if (const auto matched = match_any_substring(haystack, config.recoverable_error_patterns); !matched.empty()) {
+        return "recoverable_error pattern: " + matched;
+    }
+    if (const auto matched = match_any_substring(haystack, config.attach_visible_text_patterns); !matched.empty()) {
+        return "visible-text hint: " + matched;
+    }
+
+    return {};
+}
 
 class ComApartment {
 public:
@@ -920,8 +1036,12 @@ struct ChildProcess {
 
 struct FindWindowContext {
     const Config* config = nullptr;
-    std::optional<WindowInfo> first_match;
-    std::optional<WindowInfo> foreground_match;
+    std::vector<WindowInfo> matches;
+};
+
+struct FindWindowByPidContext {
+    const std::unordered_set<DWORD>* candidate_pids = nullptr;
+    std::vector<WindowInfo> matches;
 };
 
 std::string window_title(HWND hwnd) {
@@ -969,26 +1089,172 @@ BOOL CALLBACK enum_windows_proc(HWND hwnd, LPARAM lparam) {
     info.title = title;
     info.class_name = class_name;
     GetWindowThreadProcessId(hwnd, &info.pid);
-
-    if (!context->first_match) {
-        context->first_match = info;
-    }
-    if (hwnd == GetForegroundWindow()) {
-        context->foreground_match = info;
-        return FALSE;
-    }
-
+    context->matches.push_back(std::move(info));
     return TRUE;
 }
 
-std::optional<WindowInfo> find_target_window(const Config& config) {
+BOOL CALLBACK enum_windows_by_pid_proc(HWND hwnd, LPARAM lparam) {
+    auto* context = reinterpret_cast<FindWindowByPidContext*>(lparam);
+    if (context == nullptr || context->candidate_pids == nullptr) {
+        return TRUE;
+    }
+
+    if (!IsWindowVisible(hwnd) || GetWindow(hwnd, GW_OWNER) != nullptr) {
+        return TRUE;
+    }
+
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (!context->candidate_pids->count(pid)) {
+        return TRUE;
+    }
+
+    WindowInfo info;
+    info.hwnd = hwnd;
+    info.pid = pid;
+    info.title = window_title(hwnd);
+    info.class_name = window_class_name(hwnd);
+    context->matches.push_back(std::move(info));
+    return TRUE;
+}
+
+std::optional<WindowInfo> choose_window_match(std::vector<WindowInfo> matches, const std::string& strategy_label) {
+    if (matches.empty()) {
+        return std::nullopt;
+    }
+
+    const HWND foreground = GetForegroundWindow();
+    for (auto& match : matches) {
+        if (match.hwnd == foreground) {
+            match.selection_reason = strategy_label + " foreground match";
+            return match;
+        }
+    }
+
+    auto selected = matches.front();
+    if (matches.size() == 1) {
+        selected.selection_reason = strategy_label + " single match";
+    } else {
+        selected.selection_reason = strategy_label + " first of " + std::to_string(matches.size()) +
+                                    " matches; focus the desired window to disambiguate";
+    }
+    return selected;
+}
+
+bool try_snapshot_processes(std::unordered_map<DWORD, ProcessInfo>& processes, std::string& error) {
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        error = "CreateToolhelp32Snapshot failed with error " + std::to_string(GetLastError()) + ".";
+        return false;
+    }
+
+    PROCESSENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    if (!Process32FirstW(snapshot, &entry)) {
+        error = "Process32FirstW failed with error " + std::to_string(GetLastError()) + ".";
+        close_handle(snapshot);
+        return false;
+    }
+
+    do {
+        ProcessInfo info;
+        info.pid = entry.th32ProcessID;
+        info.parent_pid = entry.th32ParentProcessID;
+        info.exe_name = to_lower_ascii(wide_to_utf8(entry.szExeFile));
+        processes.emplace(info.pid, std::move(info));
+    } while (Process32NextW(snapshot, &entry));
+
+    close_handle(snapshot);
+    return true;
+}
+
+ProcessTreeResolution resolve_process_tree_candidates(const std::unordered_map<DWORD, ProcessInfo>& processes,
+                                                      const std::vector<std::string>& target_process_names,
+                                                      const std::vector<std::string>& terminal_process_names) {
+    ProcessTreeResolution resolution;
+
+    for (const auto& [pid, info] : processes) {
+        if (!process_name_matches(info.exe_name, target_process_names)) {
+            continue;
+        }
+
+        resolution.target_pids.push_back(pid);
+
+        std::unordered_set<DWORD> visited;
+        DWORD current_pid = pid;
+        for (int depth = 0; current_pid != 0 && depth < 64; ++depth) {
+            if (!visited.insert(current_pid).second) {
+                break;
+            }
+
+            const auto current = processes.find(current_pid);
+            if (current == processes.end()) {
+                break;
+            }
+
+            if (process_name_matches(current->second.exe_name, terminal_process_names)) {
+                resolution.terminal_pids.insert(current->second.pid);
+                break;
+            }
+
+            current_pid = current->second.parent_pid;
+        }
+    }
+
+    return resolution;
+}
+
+std::vector<WindowInfo> find_windows_by_pid_set(const std::unordered_set<DWORD>& candidate_pids) {
+    FindWindowByPidContext context;
+    context.candidate_pids = &candidate_pids;
+    EnumWindows(enum_windows_by_pid_proc, reinterpret_cast<LPARAM>(&context));
+    return context.matches;
+}
+
+std::optional<WindowInfo> find_target_window_by_title_match(const Config& config) {
     FindWindowContext context;
     context.config = &config;
     EnumWindows(enum_windows_proc, reinterpret_cast<LPARAM>(&context));
-    if (context.foreground_match) {
-        return context.foreground_match;
+    return choose_window_match(std::move(context.matches), "title_match");
+}
+
+std::optional<WindowInfo> find_target_window_by_process_tree(const Config& config) {
+    std::unordered_map<DWORD, ProcessInfo> processes;
+    std::string error;
+    if (!try_snapshot_processes(processes, error)) {
+        return std::nullopt;
     }
-    return context.first_match;
+
+    const auto resolution =
+        resolve_process_tree_candidates(processes, config.target_process_names, config.terminal_process_names);
+    if (resolution.terminal_pids.empty()) {
+        return std::nullopt;
+    }
+
+    auto matches = find_windows_by_pid_set(resolution.terminal_pids);
+    const auto label = "process_tree (" + std::to_string(resolution.target_pids.size()) + " target process(es), " +
+                       std::to_string(matches.size()) + " terminal window match(es))";
+    return choose_window_match(std::move(matches), label);
+}
+
+std::optional<WindowInfo> find_target_window(const Config& config) {
+    if (config.attach_strategy == "title_match") {
+        return find_target_window_by_title_match(config);
+    }
+
+    if (config.attach_strategy == "process_tree") {
+        return find_target_window_by_process_tree(config);
+    }
+
+    if (const auto found = find_target_window_by_process_tree(config)) {
+        return found;
+    }
+
+    if (has_title_filters(config)) {
+        return find_target_window_by_title_match(config);
+    }
+
+    return std::nullopt;
 }
 
 bool focus_window(HWND hwnd) {
@@ -1536,7 +1802,9 @@ int run_attach_mode(const Config& config, const fs::path& log_dir, Logger& logge
     AttachSession session;
 
     logger.info("watchdog",
-                "attach mode started. waiting for window title~\"" + config.window_title_contains +
+                "attach mode started. strategy=" + config.attach_strategy + " target_processes=" +
+                    join_patterns(config.target_process_names) + " terminal_processes=" +
+                    join_patterns(config.terminal_process_names) + " title~\"" + config.window_title_contains +
                     "\" class~\"" + config.window_class_contains + "\"");
 
     while (!g_stop_requested.load()) {
@@ -1547,10 +1815,16 @@ int run_attach_mode(const Config& config, const fs::path& log_dir, Logger& logge
                     session.title = found->title;
                     session.class_name = found->class_name;
                     session.last_snapshot.clear();
+                    session.snapshot_confirmed = false;
+                    session.snapshot_confirmation_reason.clear();
+                    session.unconfirmed_logged = false;
                     session.missing_logged = false;
                     state.reset_for_new_session();
-                    state.note_system_event("attached window pid=" + std::to_string(found->pid) + " title=" + found->title);
-                    logger.info("watchdog", "attached window pid=" + std::to_string(found->pid) + " title=" + found->title);
+                    state.note_system_event("attached window pid=" + std::to_string(found->pid) + " title=" +
+                                            found->title + " via " + found->selection_reason);
+                    logger.info("watchdog",
+                                "attached window pid=" + std::to_string(found->pid) + " title=" + found->title +
+                                    " via " + found->selection_reason);
                 }
             } else {
                 if (!session.missing_logged) {
@@ -1564,12 +1838,27 @@ int run_attach_mode(const Config& config, const fs::path& log_dir, Logger& logge
 
         const auto snapshot = automation.read_visible_text(session.hwnd);
         if (!snapshot.empty() && snapshot != session.last_snapshot) {
+            const auto confirmation_reason = attach_snapshot_confirmation_reason(snapshot, config);
+            const bool confirmed = !confirmation_reason.empty();
+            if (confirmed != session.snapshot_confirmed || confirmation_reason != session.snapshot_confirmation_reason) {
+                if (confirmed) {
+                    logger.info("watchdog", "attach visible-text confirmation matched " + confirmation_reason);
+                } else if (!session.unconfirmed_logged) {
+                    logger.info("watchdog",
+                                "attach window found, but visible text does not currently look like the target agent; "
+                                "idle auto input will stay paused.");
+                }
+            }
+
+            session.snapshot_confirmed = confirmed;
+            session.snapshot_confirmation_reason = confirmation_reason;
+            session.unconfirmed_logged = !confirmed;
             state.inspect_output_text(snapshot, config);
             note_snapshot_lines(state, logger, config, snapshot);
             session.last_snapshot = snapshot;
         }
 
-        if (const auto pending = state.pop_due_action(config)) {
+        if (const auto pending = state.pop_due_action(config, session.snapshot_confirmed)) {
             const auto text = build_auto_input(config, *pending, state, log_dir, logger);
             if (!text.empty()) {
                 if (send_text_to_window(session.hwnd, text, logger)) {
@@ -1599,7 +1888,7 @@ BOOL WINAPI console_handler(DWORD signal) {
 
 void print_usage() {
     std::cout
-        << "Usage: loopguard [--config path-to-ini] [--resume-last | --resume-session name]\n";
+        << "Usage: loopguard [--config path-to-ini] [--resume-last | --resume-session name] [--self-test name]\n";
 }
 
 RuntimeOptions parse_runtime_options(int argc, char* argv[]) {
@@ -1623,6 +1912,10 @@ RuntimeOptions parse_runtime_options(int argc, char* argv[]) {
             options.resume_session_name = argv[++i];
             continue;
         }
+        if (arg == "--self-test" && i + 1 < argc) {
+            options.self_test_name = argv[++i];
+            continue;
+        }
         options.config_path = arg;
     }
 
@@ -1630,7 +1923,90 @@ RuntimeOptions parse_runtime_options(int argc, char* argv[]) {
         throw std::runtime_error("Use only one of --resume-last or --resume-session.");
     }
 
+    if (options.self_test_name && (options.resume_last || options.resume_session_name)) {
+        throw std::runtime_error("Use --self-test by itself.");
+    }
+
     return options;
+}
+
+bool expect_self_test(bool condition, const std::string& message, std::string& error) {
+    if (!condition) {
+        error = message;
+        return false;
+    }
+    return true;
+}
+
+bool run_attach_detection_self_test(std::string& error) {
+    std::unordered_map<DWORD, ProcessInfo> processes;
+    processes.emplace(100, ProcessInfo{100, 1, "windowsterminal.exe"});
+    processes.emplace(110, ProcessInfo{110, 100, "pwsh.exe"});
+    processes.emplace(120, ProcessInfo{120, 110, "node.exe"});
+    processes.emplace(130, ProcessInfo{130, 120, "codex.exe"});
+    processes.emplace(200, ProcessInfo{200, 1, "openconsole.exe"});
+    processes.emplace(210, ProcessInfo{210, 200, "claude.exe"});
+    processes.emplace(300, ProcessInfo{300, 1, "powershell.exe"});
+    processes.emplace(310, ProcessInfo{310, 300, "git.exe"});
+
+    const auto resolution =
+        resolve_process_tree_candidates(processes, {"codex", "claude.exe"}, {"WindowsTerminal.exe", "OpenConsole.exe"});
+    if (!expect_self_test(resolution.target_pids.size() == 2, "expected two target agent processes", error)) {
+        return false;
+    }
+    if (!expect_self_test(resolution.terminal_pids.size() == 2, "expected two terminal ancestors", error)) {
+        return false;
+    }
+    if (!expect_self_test(resolution.terminal_pids.count(100) == 1 && resolution.terminal_pids.count(200) == 1,
+                          "expected WindowsTerminal.exe and OpenConsole.exe ancestors",
+                          error)) {
+        return false;
+    }
+
+    Config config;
+    config.wait_patterns = {"need your approval"};
+    config.recoverable_error_patterns = {"service unavailable"};
+    config.attach_visible_text_patterns = {"codex", "thinking"};
+
+    if (!expect_self_test(attach_snapshot_confirmation_reason("Need your approval before continuing", config) ==
+                              "wait pattern: need your approval",
+                          "expected wait-pattern confirmation",
+                          error)) {
+        return false;
+    }
+    if (!expect_self_test(attach_snapshot_confirmation_reason("Service unavailable, retry later", config) ==
+                              "recoverable_error pattern: service unavailable",
+                          "expected recoverable-error confirmation",
+                          error)) {
+        return false;
+    }
+    if (!expect_self_test(attach_snapshot_confirmation_reason("Codex is thinking about the patch", config) ==
+                              "visible-text hint: codex",
+                          "expected visible-text confirmation",
+                          error)) {
+        return false;
+    }
+    if (!expect_self_test(attach_snapshot_confirmation_reason("PS D:\\Repos\\LoopCode>", config).empty(),
+                          "plain shell prompt should not be confirmed as the target agent",
+                          error)) {
+        return false;
+    }
+
+    return true;
+}
+
+int run_self_test(const std::string& name) {
+    if (name == "attach-detection") {
+        std::string error;
+        if (!run_attach_detection_self_test(error)) {
+            std::cerr << "[self-test] attach-detection failed: " << error << std::endl;
+            return 1;
+        }
+        std::cout << "attach-detection self-test passed." << std::endl;
+        return 0;
+    }
+
+    throw std::runtime_error("Unknown self-test: " + name);
 }
 
 }  // namespace
@@ -1642,6 +2018,9 @@ int main(int argc, char* argv[]) {
 
     try {
         const auto options = parse_runtime_options(argc, argv);
+        if (options.self_test_name) {
+            return run_self_test(*options.self_test_name);
+        }
         auto config_path = options.config_path;
         auto config = load_config(config_path);
         std::optional<PendingAction> startup_resume;

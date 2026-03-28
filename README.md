@@ -5,14 +5,15 @@
 这版有两种模式：
 
 - `spawn`：由 `LoopGuard` 启动 agent 子进程，基于 stdin/stdout pipe 监控
-- `attach`：你先手动打开 agent 窗口，`LoopGuard` 再按窗口标题附着，用 UI Automation 读可见文本，并用 `SendInput` 回发输入
+- `attach`：你先手动打开 agent 窗口，`LoopGuard` 再按进程树附着到对应终端窗口，用 UI Automation 读可见文本，并用 `SendInput` 回发输入
 
 ## 现在已经有的能力
 
 - 监督一个子进程命令，例如 `codex` 或 `claude`
-- 附着到已打开的窗口，例如标题里带 `codex` 的 Windows Terminal
+- 附着到已打开的窗口，例如已经打开的 `codex` / `claude` 所在 Windows Terminal
 - 实时采集 `stdout/stderr`，同时落 `logs/loopguard.log`
 - 在 attach 模式下轮询可见窗口文本
+- attach 模式默认按 `codex.exe/claude.exe -> 终端进程 -> 顶层窗口` 自动找目标，不再强依赖窗口标题
 - 基于关键字匹配触发自动输入
 - 长时间无输出时自动补发 `继续`
 - 子进程退出后自动重启
@@ -37,8 +38,12 @@
 
 - `[agent].command_line`：要启动的 agent 命令
 - `[agent].mode`：`spawn` 或 `attach`
-- `[agent].window_title_contains`：attach 模式下要匹配的窗口标题片段
-- `[agent].window_class_contains`：attach 模式下可选的窗口类名片段
+- `[agent].attach_strategy`：attach 模式下的定位策略，支持 `auto`、`process_tree`、`title_match`
+- `[agent].target_process_names`：attach 模式下要追踪的 agent 进程名，使用 `||` 分隔
+- `[agent].terminal_process_names`：attach 模式下可作为终端祖先进程的进程名，使用 `||` 分隔
+- `[agent].attach_visible_text_contains`：attach 模式下可见文本确认关键字，使用 `||` 分隔
+- `[agent].window_title_contains`：旧版标题匹配附着的窗口标题片段；`attach_strategy=title_match` 或 `auto` fallback 时使用
+- `[agent].window_class_contains`：旧版标题匹配附着的窗口类名片段
 - `[agent].workdir`：子进程工作目录
 - `[agent].restart_on_exit`：退出后是否自动重启
 - `[watchdog].idle_seconds`：多久没输出就判定为卡住
@@ -154,6 +159,7 @@ cl /std:c++17 /EHsc /W4 src\main.cpp /Fe:loopguard.exe
 
 - 打包脚本能生成 zip 和 sha256，并且包内容完整
 - `llm-decider.ps1` 能用 mock 响应正确提取模型决策
+- attach 进程树识别和可见文本确认有一条内置 self-test
 - session 保存与 `--resume-session` 恢复链路可用
 
 GitHub Actions 也会在打包前先跑这组 smoke tests，并上传 `build/test-output/` 作为测试工件。
@@ -196,12 +202,23 @@ GitHub Actions 也会在打包前先跑这组 smoke tests，并上传 `build/tes
 如果你是“先自己打开 `codex/claude` 再让工具接管”，用 attach 示例：
 
 1. 先手动打开 `codex` 或 `claude`
-2. 确认目标窗口里光标确实停在 agent 的输入位置
-3. 修改 `examples\loopguard-attach.ini` 里的 `window_title_contains`
-4. 运行：
+2. 如果你同时开了多个终端窗口，先把你想接管的那个切到前台
+3. 确认目标窗口里当前可见内容确实是 agent 对话，而不是别的 tab / shell
+4. 按需修改 `examples\loopguard-attach.ini` 里的 `target_process_names`、`terminal_process_names` 或 `attach_visible_text_contains`
+5. 运行：
 
 ```powershell
 .\loopguard.exe --config .\examples\loopguard-attach.ini
+```
+
+默认 attach 示例会优先按进程树找已经运行的 `codex.exe` / `claude.exe`，再映射到对应的终端窗口。
+
+如果你想兼容旧方式，也可以改成：
+
+```ini
+[agent]
+attach_strategy = title_match
+window_title_contains = codex
 ```
 
 ## 适合你的下一步
@@ -215,7 +232,8 @@ GitHub Actions 也会在打包前先跑这组 smoke tests，并上传 `build/tes
 ## 当前限制
 
 - `spawn` 模式当前是 pipe 方案，不是 PTY 方案
-- `attach` 模式依赖窗口标题匹配、UI Automation 和前台输入焦点
+- `attach` 模式现在优先依赖进程树、UI Automation 和前台输入焦点；旧版标题匹配仍可作为 fallback
+- 如果同一个 Windows Terminal 窗口里有多个 tab，`LoopGuard` 只能看到当前可见 tab 的文本，所以 idle 自动恢复会先做一次可见文本确认
 - `attach` 模式把文本发到当前光标位置，所以如果你把焦点切到别的输入框，发送位置也会偏
 - 一键 resume 当前主要面向 `spawn` 模式，`attach` 模式默认不保存可恢复会话
 - 关键字匹配是 substring，不是正则

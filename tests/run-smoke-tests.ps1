@@ -125,6 +125,15 @@ reason: manual resume
     Assert-True ($result.Trim() -eq "请基于刚才的上下文继续，并先说明恢复点。") "mocked llm decider should return the expected prompt"
 }
 
+function Test-AttachDetectionSelfTest {
+    param(
+        [string]$ExePath
+    )
+
+    $result = & $ExePath --self-test attach-detection 2>&1 | Out-String
+    Assert-Contains $result "attach-detection self-test passed." "attach detection self-test should pass"
+}
+
 function Test-SessionResume {
     param(
         [string]$RepoRoot,
@@ -205,6 +214,7 @@ New-Item -ItemType Directory -Force -Path $testRoot | Out-Null
 
 Test-Package -RepoRoot $repoRoot -BuildRoot $buildRoot -Configuration $Configuration -TestRoot $testRoot
 Test-LlmDeciderMock -RepoRoot $repoRoot -TestRoot $testRoot
+Test-AttachDetectionSelfTest -ExePath $exePath
 Test-SessionResume -RepoRoot $repoRoot -ExePath $exePath -TestRoot $testRoot
 
 Write-Host "Smoke tests passed."
