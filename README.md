@@ -80,6 +80,21 @@ cmake --build build --config Release
 cl /std:c++17 /EHsc /W4 src\main.cpp /Fe:loopguard.exe
 ```
 
+## 打包
+
+本地打包脚本在 `scripts/package.ps1`。它会把 `loopguard.exe`、示例配置、脚本和 `README.md` 打成 zip，并额外生成一个 SHA256 文件：
+
+```powershell
+.\scripts\package.ps1 -BuildDir build -Configuration Release -Version dev
+```
+
+默认输出到 `dist/`。
+
+仓库里也已经带了 GitHub Actions workflow：
+
+- push 到 `main`、PR 到 `main`、手动触发时，会在 `windows-latest` 上编译并上传打包产物为 workflow artifact
+- push `v*` tag 时，会额外把 zip 和 `.sha256` 上传到 GitHub Release
+
 ## 运行
 
 默认读取 `examples/loopguard.ini`：

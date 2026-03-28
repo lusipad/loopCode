@@ -1,6 +1,9 @@
 build/
+dist*/
 logs/
 *.exe
+*.zip
+*.sha256
 *.ilk
 *.obj
 *.pdb
