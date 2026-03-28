@@ -1,0 +1,1444 @@
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+
+#include <windows.h>
+#include <Unknwn.h>
+#include <UIAutomationClient.h>
+#include <UIAutomationCoreApi.h>
+#include <wrl/client.h>
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cctype>
+#include <ctime>
+#include <cstdlib>
+#include <deque>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <mutex>
+#include <oleauto.h>
+#include <optional>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+namespace fs = std::filesystem;
+using Clock = std::chrono::steady_clock;
+using Microsoft::WRL::ComPtr;
+
+namespace {
+
+std::atomic_bool g_stop_requested{false};
+
+std::string trim(std::string value) {
+    const auto not_space = [](unsigned char ch) { return !std::isspace(ch); };
+    value.erase(value.begin(), std::find_if(value.begin(), value.end(), not_space));
+    value.erase(std::find_if(value.rbegin(), value.rend(), not_space).base(), value.end());
+    return value;
+}
+
+std::string strip_bom(std::string value) {
+    constexpr unsigned char utf8_bom[] = {0xEF, 0xBB, 0xBF};
+    if (value.size() >= 3 && static_cast<unsigned char>(value[0]) == utf8_bom[0] &&
+        static_cast<unsigned char>(value[1]) == utf8_bom[1] &&
+        static_cast<unsigned char>(value[2]) == utf8_bom[2]) {
+        value.erase(0, 3);
+    }
+    return value;
+}
+
+std::string to_lower_ascii(std::string_view input) {
+    std::string result;
+    result.reserve(input.size());
+    for (unsigned char ch : input) {
+        result.push_back(static_cast<char>(std::tolower(ch)));
+    }
+    return result;
+}
+
+void replace_all(std::string& text, const std::string& needle, const std::string& replacement) {
+    if (needle.empty()) {
+        return;
+    }
+
+    std::size_t position = 0;
+    while ((position = text.find(needle, position)) != std::string::npos) {
+        text.replace(position, needle.size(), replacement);
+        position += replacement.size();
+    }
+}
+
+std::vector<std::string> split_patterns(const std::string& value) {
+    std::vector<std::string> parts;
+    std::size_t start = 0;
+    while (start <= value.size()) {
+        const auto pos = value.find("||", start);
+        const auto raw = pos == std::string::npos ? value.substr(start) : value.substr(start, pos - start);
+        const auto trimmed = trim(raw);
+        if (!trimmed.empty()) {
+            parts.push_back(trimmed);
+        }
+        if (pos == std::string::npos) {
+            break;
+        }
+        start = pos + 2;
+    }
+    return parts;
+}
+
+std::string normalize_line(std::string text) {
+    if (!text.empty() && text.back() == '\r') {
+        text.pop_back();
+    }
+    return text;
+}
+
+std::string decode_escaped_text(std::string text) {
+    replace_all(text, "\\r\\n", "\n");
+    replace_all(text, "\\n", "\n");
+    replace_all(text, "\\t", "\t");
+    return text;
+}
+
+std::wstring utf8_to_wide(const std::string& input) {
+    if (input.empty()) {
+        return {};
+    }
+
+    const int size = MultiByteToWideChar(CP_UTF8, 0, input.c_str(), static_cast<int>(input.size()), nullptr, 0);
+    if (size <= 0) {
+        throw std::runtime_error("MultiByteToWideChar failed.");
+    }
+
+    std::wstring output(static_cast<std::size_t>(size), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, input.c_str(), static_cast<int>(input.size()), output.data(), size);
+    return output;
+}
+
+std::string wide_to_utf8(const std::wstring& input) {
+    if (input.empty()) {
+        return {};
+    }
+
+    const int size = WideCharToMultiByte(CP_UTF8, 0, input.c_str(), static_cast<int>(input.size()), nullptr, 0, nullptr, nullptr);
+    if (size <= 0) {
+        throw std::runtime_error("WideCharToMultiByte failed.");
+    }
+
+    std::string output(static_cast<std::size_t>(size), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, input.c_str(), static_cast<int>(input.size()), output.data(), size, nullptr, nullptr);
+    return output;
+}
+
+std::string bstr_to_utf8(BSTR value) {
+    if (value == nullptr) {
+        return {};
+    }
+    return wide_to_utf8(std::wstring(value, SysStringLen(value)));
+}
+
+fs::path path_from_utf8(const std::string& text) {
+    return fs::path(utf8_to_wide(text));
+}
+
+std::string now_timestamp() {
+    const auto now = std::chrono::system_clock::now();
+    const std::time_t current = std::chrono::system_clock::to_time_t(now);
+    std::tm local_tm{};
+    localtime_s(&local_tm, &current);
+
+    char buffer[64];
+    std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &local_tm);
+    return buffer;
+}
+
+std::string compact_timestamp() {
+    const auto now = std::chrono::system_clock::now();
+    const std::time_t current = std::chrono::system_clock::to_time_t(now);
+    std::tm local_tm{};
+    localtime_s(&local_tm, &current);
+
+    char buffer[32];
+    std::strftime(buffer, sizeof(buffer), "%Y%m%d-%H%M%S", &local_tm);
+    return std::string(buffer) + "-" + std::to_string(GetCurrentProcessId()) + "-" + std::to_string(GetTickCount64());
+}
+
+std::string shorten_for_log(std::string_view input, std::size_t max_size = 160) {
+    std::string result(input);
+    replace_all(result, "\r", " ");
+    replace_all(result, "\n", " ");
+    if (result.size() > max_size) {
+        result.resize(max_size - 3);
+        result += "...";
+    }
+    return result;
+}
+
+std::vector<std::string> split_lines(const std::string& text) {
+    std::vector<std::string> lines;
+    std::string current;
+    for (char ch : text) {
+        if (ch == '\r') {
+            continue;
+        }
+        if (ch == '\n') {
+            lines.push_back(current);
+            current.clear();
+            continue;
+        }
+        current.push_back(ch);
+    }
+    if (!current.empty()) {
+        lines.push_back(current);
+    }
+    return lines;
+}
+
+std::string tail_lines(const std::string& text, std::size_t max_lines) {
+    const auto lines = split_lines(text);
+    if (lines.size() <= max_lines) {
+        return text;
+    }
+
+    std::ostringstream builder;
+    const auto start = lines.size() - max_lines;
+    for (std::size_t i = start; i < lines.size(); ++i) {
+        if (i > start) {
+            builder << '\n';
+        }
+        builder << lines[i];
+    }
+    return builder.str();
+}
+
+void close_handle(HANDLE& handle) {
+    if (handle != nullptr && handle != INVALID_HANDLE_VALUE) {
+        CloseHandle(handle);
+        handle = nullptr;
+    }
+}
+
+bool sleep_with_stop(int seconds) {
+    for (int i = 0; i < seconds * 10; ++i) {
+        if (g_stop_requested.load()) {
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    return !g_stop_requested.load();
+}
+
+struct IniFile {
+    std::unordered_map<std::string, std::string> values;
+
+    static IniFile load(const fs::path& path) {
+        std::ifstream input(path, std::ios::binary);
+        if (!input) {
+            throw std::runtime_error("Unable to open config file: " + path.string());
+        }
+
+        IniFile ini;
+        std::string current_section;
+        std::string line;
+        bool first_line = true;
+
+        while (std::getline(input, line)) {
+            if (first_line) {
+                line = strip_bom(std::move(line));
+                first_line = false;
+            }
+
+            auto cleaned = trim(line);
+            if (cleaned.empty() || cleaned[0] == ';' || cleaned[0] == '#') {
+                continue;
+            }
+
+            if (cleaned.front() == '[' && cleaned.back() == ']') {
+                cleaned.erase(cleaned.begin());
+                cleaned.pop_back();
+                current_section = to_lower_ascii(trim(cleaned));
+                continue;
+            }
+
+            const auto delimiter = cleaned.find('=');
+            if (delimiter == std::string::npos) {
+                continue;
+            }
+
+            auto key = to_lower_ascii(trim(cleaned.substr(0, delimiter)));
+            auto value = trim(cleaned.substr(delimiter + 1));
+            ini.values[current_section + "." + key] = value;
+        }
+
+        return ini;
+    }
+
+    std::string get(const std::string& section, const std::string& key, const std::string& fallback) const {
+        const auto full_key = to_lower_ascii(section) + "." + to_lower_ascii(key);
+        const auto it = values.find(full_key);
+        return it == values.end() ? fallback : it->second;
+    }
+};
+
+bool parse_bool(const std::string& value, bool fallback) {
+    const auto normalized = to_lower_ascii(trim(value));
+    if (normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on") {
+        return true;
+    }
+    if (normalized == "0" || normalized == "false" || normalized == "no" || normalized == "off") {
+        return false;
+    }
+    return fallback;
+}
+
+int parse_int(const std::string& value, int fallback) {
+    try {
+        return value.empty() ? fallback : std::stoi(value);
+    } catch (...) {
+        return fallback;
+    }
+}
+
+struct Config {
+    std::string mode = "spawn";
+    std::string command_line;
+    std::string workdir = ".";
+    bool restart_on_exit = true;
+    int max_restarts = -1;
+    int restart_delay_seconds = 10;
+    std::string window_title_contains;
+    std::string window_class_contains;
+    int idle_seconds = 240;
+    int attach_poll_millis = 1500;
+    int action_cooldown_seconds = 45;
+    int initial_resume_delay_seconds = 3;
+    int transcript_keep_lines = 120;
+    int decision_timeout_seconds = 20;
+    bool echo_output = true;
+    std::string log_dir = "logs";
+    std::string continue_message = "continue";
+    std::string resume_template =
+        "Continue the interrupted task.\n"
+        "Reason: {reason}\n"
+        "Recent transcript:\n"
+        "{transcript}\n";
+    std::vector<std::string> wait_patterns;
+    std::vector<std::string> recoverable_error_patterns;
+    std::string decision_mode = "fixed";
+    std::string external_command;
+};
+
+Config load_config(const fs::path& path) {
+    const auto ini = IniFile::load(path);
+
+    Config config;
+    config.mode = to_lower_ascii(ini.get("agent", "mode", "spawn"));
+    config.command_line = ini.get("agent", "command_line", "");
+    config.workdir = ini.get("agent", "workdir", ".");
+    config.restart_on_exit = parse_bool(ini.get("agent", "restart_on_exit", "true"), true);
+    config.max_restarts = parse_int(ini.get("agent", "max_restarts", "-1"), -1);
+    config.restart_delay_seconds = parse_int(ini.get("agent", "restart_delay_seconds", "10"), 10);
+    config.window_title_contains = ini.get("agent", "window_title_contains", "");
+    config.window_class_contains = ini.get("agent", "window_class_contains", "");
+
+    config.idle_seconds = parse_int(ini.get("watchdog", "idle_seconds", "240"), 240);
+    config.attach_poll_millis = parse_int(ini.get("watchdog", "attach_poll_millis", "1500"), 1500);
+    config.action_cooldown_seconds = parse_int(ini.get("watchdog", "action_cooldown_seconds", "45"), 45);
+    config.initial_resume_delay_seconds = parse_int(ini.get("watchdog", "initial_resume_delay_seconds", "3"), 3);
+    config.transcript_keep_lines = parse_int(ini.get("watchdog", "transcript_keep_lines", "120"), 120);
+    config.decision_timeout_seconds = parse_int(ini.get("watchdog", "decision_timeout_seconds", "20"), 20);
+    config.echo_output = parse_bool(ini.get("watchdog", "echo_output", "true"), true);
+    config.log_dir = ini.get("watchdog", "log_dir", "logs");
+
+    config.continue_message = decode_escaped_text(ini.get("actions", "continue_message", "continue"));
+    config.resume_template = decode_escaped_text(ini.get(
+        "actions",
+        "resume_template",
+        "Continue the interrupted task.\nReason: {reason}\nRecent transcript:\n{transcript}\n"));
+
+    config.wait_patterns = split_patterns(
+        ini.get("patterns", "wait", "continue||继续||press enter||confirm||waiting for your input||need your approval"));
+    config.recoverable_error_patterns = split_patterns(
+        ini.get("patterns", "recoverable_error",
+                "timed out||timeout||network||connection reset||service unavailable||rate limit||temporary failure"));
+
+    config.decision_mode = to_lower_ascii(ini.get("decision", "mode", "fixed"));
+    config.external_command = ini.get("decision", "external_command", "");
+
+    if (config.mode != "spawn" && config.mode != "attach") {
+        throw std::runtime_error("Config key [agent] mode must be either spawn or attach.");
+    }
+
+    if (config.mode == "spawn" && config.command_line.empty()) {
+        throw std::runtime_error("Config key [agent] command_line is required.");
+    }
+
+    if (config.mode == "attach" && config.window_title_contains.empty() && config.window_class_contains.empty()) {
+        throw std::runtime_error("Attach mode requires [agent] window_title_contains or window_class_contains.");
+    }
+
+    return config;
+}
+
+class Logger {
+public:
+    explicit Logger(const fs::path& file_path) {
+        fs::create_directories(file_path.parent_path());
+        file_.open(file_path, std::ios::app | std::ios::binary);
+        if (!file_) {
+            throw std::runtime_error("Unable to open log file: " + file_path.string());
+        }
+    }
+
+    void info(const std::string& category, const std::string& message, bool to_stderr = false) {
+        const auto line = "[" + now_timestamp() + "] [" + category + "] " + message;
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (to_stderr) {
+            std::cerr << line << std::endl;
+        } else {
+            std::cout << line << std::endl;
+        }
+        file_ << line << '\n';
+        file_.flush();
+    }
+
+    void child_line(const std::string& source, const std::string& line, bool echo_to_console) {
+        const auto rendered = "[" + now_timestamp() + "] [" + source + "] " + line;
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (echo_to_console) {
+            std::cout << rendered << std::endl;
+        }
+        file_ << rendered << '\n';
+        file_.flush();
+    }
+
+private:
+    std::mutex mutex_;
+    std::ofstream file_;
+};
+
+enum class TriggerKind {
+    Continue,
+    RestartResume,
+    Idle,
+};
+
+struct PendingAction {
+    TriggerKind kind = TriggerKind::Continue;
+    std::string reason;
+    int priority = 0;
+};
+
+class SharedState {
+public:
+    explicit SharedState(std::size_t keep_lines)
+        : keep_lines_(keep_lines),
+          last_activity_(Clock::now()),
+          last_action_(Clock::now() - std::chrono::hours(24)) {}
+
+    void reset_for_new_session() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        last_activity_ = Clock::now();
+        last_action_ = Clock::now() - std::chrono::hours(24);
+        pending_.reset();
+        suppressed_trigger_key_.clear();
+    }
+
+    void note_system_event(const std::string& line) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        push_transcript_locked("[system] " + line);
+    }
+
+    void inspect_output_text(const std::string& text, const Config& config) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        last_activity_ = Clock::now();
+
+        const auto haystack = to_lower_ascii(text);
+        refresh_suppression_locked(haystack);
+        if (const auto matched = match_any(haystack, config.recoverable_error_patterns); !matched.empty()) {
+            const auto key = "recoverable:" + to_lower_ascii(matched);
+            if (suppressed_trigger_key_ != key) {
+                queue_locked({TriggerKind::Continue, "matched recoverable_error pattern: " + matched, 2});
+            }
+            return;
+        }
+        if (const auto matched = match_any(haystack, config.wait_patterns); !matched.empty()) {
+            const auto key = "wait:" + to_lower_ascii(matched);
+            if (suppressed_trigger_key_ != key) {
+                queue_locked({TriggerKind::Continue, "matched wait pattern: " + matched, 1});
+            }
+        }
+    }
+
+    void note_output_line(const std::string& source, const std::string& line) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        last_activity_ = Clock::now();
+        push_transcript_locked("[" + source + "] " + line);
+    }
+
+    void schedule_restart_resume(const std::string& reason) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        queue_locked({TriggerKind::RestartResume, reason, 3});
+    }
+
+    std::optional<PendingAction> pop_due_action(const Config& config) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto now = Clock::now();
+
+        if (pending_ && seconds_since_locked(last_action_, now) >= config.action_cooldown_seconds) {
+            auto action = pending_;
+            pending_.reset();
+            last_action_ = now;
+            return action;
+        }
+
+        if (config.idle_seconds > 0 &&
+            seconds_since_locked(last_activity_, now) >= config.idle_seconds &&
+            seconds_since_locked(last_action_, now) >= config.action_cooldown_seconds) {
+            last_activity_ = now;
+            last_action_ = now;
+            return PendingAction{TriggerKind::Idle, "idle for " + std::to_string(config.idle_seconds) + " seconds", 1};
+        }
+
+        return std::nullopt;
+    }
+
+    std::string recent_transcript() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::ostringstream builder;
+        bool first = true;
+        for (const auto& line : transcript_) {
+            if (!first) {
+                builder << '\n';
+            }
+            builder << line;
+            first = false;
+        }
+        return builder.str();
+    }
+
+    void note_action_sent(const PendingAction& action) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        suppressed_trigger_key_ = suppression_key_from_reason(action.reason);
+    }
+
+private:
+    static long long seconds_since_locked(const Clock::time_point& start, const Clock::time_point& end) {
+        return std::chrono::duration_cast<std::chrono::seconds>(end - start).count();
+    }
+
+    void push_transcript_locked(const std::string& line) {
+        transcript_.push_back(line);
+        while (transcript_.size() > keep_lines_) {
+            transcript_.pop_front();
+        }
+    }
+
+    std::string match_any(const std::string& haystack, const std::vector<std::string>& patterns) const {
+        for (const auto& raw_pattern : patterns) {
+            const auto normalized = to_lower_ascii(raw_pattern);
+            if (!normalized.empty() && haystack.find(normalized) != std::string::npos) {
+                return raw_pattern;
+            }
+        }
+        return {};
+    }
+
+    void queue_locked(PendingAction next) {
+        if (!pending_ || next.priority >= pending_->priority) {
+            pending_ = std::move(next);
+        }
+    }
+
+    static std::string suppression_key_from_reason(const std::string& reason) {
+        constexpr std::string_view wait_prefix = "matched wait pattern: ";
+        constexpr std::string_view recoverable_prefix = "matched recoverable_error pattern: ";
+
+        if (reason.rfind(wait_prefix.data(), 0) == 0) {
+            return "wait:" + to_lower_ascii(reason.substr(wait_prefix.size()));
+        }
+        if (reason.rfind(recoverable_prefix.data(), 0) == 0) {
+            return "recoverable:" + to_lower_ascii(reason.substr(recoverable_prefix.size()));
+        }
+        return {};
+    }
+
+    void refresh_suppression_locked(const std::string& haystack) {
+        if (suppressed_trigger_key_.empty()) {
+            return;
+        }
+
+        const auto delimiter = suppressed_trigger_key_.find(':');
+        if (delimiter == std::string::npos || delimiter + 1 >= suppressed_trigger_key_.size()) {
+            suppressed_trigger_key_.clear();
+            return;
+        }
+
+        const auto pattern = suppressed_trigger_key_.substr(delimiter + 1);
+        if (haystack.find(pattern) == std::string::npos) {
+            suppressed_trigger_key_.clear();
+        }
+    }
+
+    mutable std::mutex mutex_;
+    std::deque<std::string> transcript_;
+    std::size_t keep_lines_;
+    Clock::time_point last_activity_;
+    Clock::time_point last_action_;
+    std::optional<PendingAction> pending_;
+    std::string suppressed_trigger_key_;
+};
+
+struct WindowInfo {
+    HWND hwnd = nullptr;
+    DWORD pid = 0;
+    std::string title;
+    std::string class_name;
+};
+
+struct AttachSession {
+    HWND hwnd = nullptr;
+    std::string title;
+    std::string class_name;
+    std::string last_snapshot;
+    bool missing_logged = false;
+};
+
+class ComApartment {
+public:
+    ComApartment() {
+        const HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
+            throw std::runtime_error("CoInitializeEx failed.");
+        }
+        initialized_ = SUCCEEDED(hr);
+    }
+
+    ~ComApartment() {
+        if (initialized_) {
+            CoUninitialize();
+        }
+    }
+
+private:
+    bool initialized_ = false;
+};
+
+class UiAutomationClient {
+public:
+    UiAutomationClient() {
+        const HRESULT hr = CoCreateInstance(CLSID_CUIAutomation,
+                                            nullptr,
+                                            CLSCTX_INPROC_SERVER,
+                                            IID_PPV_ARGS(&automation_));
+        if (FAILED(hr) || !automation_) {
+            throw std::runtime_error("CoCreateInstance(CUIAutomation) failed.");
+        }
+    }
+
+    std::string read_visible_text(HWND hwnd) const {
+        if (hwnd == nullptr) {
+            return {};
+        }
+
+        ComPtr<IUIAutomationElement> element;
+        if (FAILED(automation_->ElementFromHandle(hwnd, &element)) || !element) {
+            return {};
+        }
+
+        if (const auto direct = try_text_from_element(element.Get()); !direct.empty()) {
+            return direct;
+        }
+
+        VARIANT variant{};
+        variant.vt = VT_BOOL;
+        variant.boolVal = VARIANT_TRUE;
+
+        ComPtr<IUIAutomationCondition> condition;
+        if (SUCCEEDED(automation_->CreatePropertyCondition(UIA_IsTextPatternAvailablePropertyId, variant, &condition)) && condition) {
+            ComPtr<IUIAutomationElement> match;
+            if (SUCCEEDED(element->FindFirst(TreeScope_Subtree, condition.Get(), &match)) && match) {
+                if (const auto text = try_text_from_element(match.Get()); !text.empty()) {
+                    return text;
+                }
+            }
+        }
+
+        if (SUCCEEDED(automation_->CreatePropertyCondition(UIA_IsValuePatternAvailablePropertyId, variant, &condition)) && condition) {
+            ComPtr<IUIAutomationElement> match;
+            if (SUCCEEDED(element->FindFirst(TreeScope_Subtree, condition.Get(), &match)) && match) {
+                if (const auto text = try_value_from_element(match.Get()); !text.empty()) {
+                    return text;
+                }
+            }
+        }
+
+        return {};
+    }
+
+private:
+    static std::string try_text_from_element(IUIAutomationElement* element) {
+        if (element == nullptr) {
+            return {};
+        }
+
+        ComPtr<IUIAutomationTextPattern> text_pattern;
+        if (FAILED(element->GetCurrentPatternAs(UIA_TextPatternId, IID_PPV_ARGS(&text_pattern))) || !text_pattern) {
+            return {};
+        }
+
+        ComPtr<IUIAutomationTextRange> range;
+        if (FAILED(text_pattern->get_DocumentRange(&range)) || !range) {
+            return {};
+        }
+
+        BSTR text = nullptr;
+        if (FAILED(range->GetText(-1, &text)) || text == nullptr) {
+            return {};
+        }
+
+        std::string result = bstr_to_utf8(text);
+        SysFreeString(text);
+        return result;
+    }
+
+    static std::string try_value_from_element(IUIAutomationElement* element) {
+        if (element == nullptr) {
+            return {};
+        }
+
+        ComPtr<IUIAutomationValuePattern> value_pattern;
+        if (FAILED(element->GetCurrentPatternAs(UIA_ValuePatternId, IID_PPV_ARGS(&value_pattern))) || !value_pattern) {
+            return {};
+        }
+
+        BSTR value = nullptr;
+        if (FAILED(value_pattern->get_CurrentValue(&value)) || value == nullptr) {
+            return {};
+        }
+
+        std::string result = bstr_to_utf8(value);
+        SysFreeString(value);
+        return result;
+    }
+
+    ComPtr<IUIAutomation> automation_;
+};
+
+struct ChildProcess {
+    HANDLE process = nullptr;
+    HANDLE stdin_write = nullptr;
+    DWORD pid = 0;
+};
+
+struct FindWindowContext {
+    const Config* config = nullptr;
+    std::optional<WindowInfo> first_match;
+    std::optional<WindowInfo> foreground_match;
+};
+
+std::string window_title(HWND hwnd) {
+    const int length = GetWindowTextLengthW(hwnd);
+    std::wstring buffer(static_cast<std::size_t>(length) + 1, L'\0');
+    GetWindowTextW(hwnd, buffer.data(), length + 1);
+    buffer.resize(length);
+    return wide_to_utf8(buffer);
+}
+
+std::string window_class_name(HWND hwnd) {
+    wchar_t buffer[256];
+    const int length = GetClassNameW(hwnd, buffer, static_cast<int>(sizeof(buffer) / sizeof(buffer[0])));
+    return length > 0 ? wide_to_utf8(std::wstring(buffer, buffer + length)) : std::string{};
+}
+
+BOOL CALLBACK enum_windows_proc(HWND hwnd, LPARAM lparam) {
+    auto* context = reinterpret_cast<FindWindowContext*>(lparam);
+    if (context == nullptr || context->config == nullptr) {
+        return TRUE;
+    }
+
+    if (!IsWindowVisible(hwnd) || GetWindow(hwnd, GW_OWNER) != nullptr) {
+        return TRUE;
+    }
+
+    const auto title = window_title(hwnd);
+    const auto class_name = window_class_name(hwnd);
+    const auto title_lower = to_lower_ascii(title);
+    const auto class_lower = to_lower_ascii(class_name);
+
+    const auto title_filter = to_lower_ascii(context->config->window_title_contains);
+    const auto class_filter = to_lower_ascii(context->config->window_class_contains);
+
+    if (!title_filter.empty() && title_lower.find(title_filter) == std::string::npos) {
+        return TRUE;
+    }
+
+    if (!class_filter.empty() && class_lower.find(class_filter) == std::string::npos) {
+        return TRUE;
+    }
+
+    WindowInfo info;
+    info.hwnd = hwnd;
+    info.title = title;
+    info.class_name = class_name;
+    GetWindowThreadProcessId(hwnd, &info.pid);
+
+    if (!context->first_match) {
+        context->first_match = info;
+    }
+    if (hwnd == GetForegroundWindow()) {
+        context->foreground_match = info;
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+std::optional<WindowInfo> find_target_window(const Config& config) {
+    FindWindowContext context;
+    context.config = &config;
+    EnumWindows(enum_windows_proc, reinterpret_cast<LPARAM>(&context));
+    if (context.foreground_match) {
+        return context.foreground_match;
+    }
+    return context.first_match;
+}
+
+bool focus_window(HWND hwnd) {
+    if (hwnd == nullptr || !IsWindow(hwnd)) {
+        return false;
+    }
+
+    if (IsIconic(hwnd)) {
+        ShowWindow(hwnd, SW_RESTORE);
+    }
+
+    const HWND foreground = GetForegroundWindow();
+    const DWORD foreground_thread = foreground != nullptr ? GetWindowThreadProcessId(foreground, nullptr) : 0;
+    const DWORD current_thread = GetCurrentThreadId();
+
+    if (foreground_thread != 0 && foreground_thread != current_thread) {
+        AttachThreadInput(foreground_thread, current_thread, TRUE);
+    }
+
+    BringWindowToTop(hwnd);
+    SetForegroundWindow(hwnd);
+    SetFocus(hwnd);
+
+    if (foreground_thread != 0 && foreground_thread != current_thread) {
+        AttachThreadInput(foreground_thread, current_thread, FALSE);
+    }
+
+    return GetForegroundWindow() == hwnd;
+}
+
+void append_unicode_key(std::vector<INPUT>& inputs, wchar_t ch) {
+    INPUT down{};
+    down.type = INPUT_KEYBOARD;
+    down.ki.wScan = ch;
+    down.ki.dwFlags = KEYEVENTF_UNICODE;
+
+    INPUT up = down;
+    up.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+
+    inputs.push_back(down);
+    inputs.push_back(up);
+}
+
+void append_vk_key(std::vector<INPUT>& inputs, WORD vk) {
+    INPUT down{};
+    down.type = INPUT_KEYBOARD;
+    down.ki.wVk = vk;
+
+    INPUT up = down;
+    up.ki.dwFlags = KEYEVENTF_KEYUP;
+
+    inputs.push_back(down);
+    inputs.push_back(up);
+}
+
+bool send_text_to_window(HWND hwnd, const std::string& text, Logger& logger) {
+    if (hwnd == nullptr || !IsWindow(hwnd)) {
+        logger.info("watchdog", "target window is unavailable; attach auto input skipped.", true);
+        return false;
+    }
+
+    if (!focus_window(hwnd)) {
+        logger.info("watchdog", "failed to focus target window before sending auto input.", true);
+        return false;
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+
+    const auto wide_text = utf8_to_wide(text);
+    std::vector<INPUT> inputs;
+    inputs.reserve(wide_text.size() * 2 + 4);
+
+    for (wchar_t ch : wide_text) {
+        if (ch == L'\r') {
+            continue;
+        }
+        if (ch == L'\n') {
+            append_vk_key(inputs, VK_RETURN);
+            continue;
+        }
+        append_unicode_key(inputs, ch);
+    }
+
+    if (wide_text.empty() || wide_text.back() != L'\n') {
+        append_vk_key(inputs, VK_RETURN);
+    }
+
+    const UINT sent = SendInput(static_cast<UINT>(inputs.size()), inputs.data(), sizeof(INPUT));
+    if (sent != inputs.size()) {
+        logger.info("watchdog", "SendInput did not submit the full auto input payload.", true);
+        return false;
+    }
+
+    logger.info("watchdog", "sent auto input to attached window: " + shorten_for_log(text));
+    return true;
+}
+
+void note_snapshot_lines(SharedState& state, Logger& logger, const Config& config, const std::string& snapshot) {
+    const auto clipped = tail_lines(snapshot, 40);
+    for (const auto& line : split_lines(clipped)) {
+        if (trim(line).empty()) {
+            continue;
+        }
+        state.note_output_line("attach", line);
+        logger.child_line("attach", line, config.echo_output);
+    }
+}
+
+bool send_text_to_child(HANDLE stdin_write, const std::string& text, Logger& logger) {
+    if (stdin_write == nullptr) {
+        logger.info("watchdog", "stdin pipe is not available; auto input skipped.", true);
+        return false;
+    }
+
+    std::string payload = text;
+    if (payload.empty()) {
+        return false;
+    }
+
+    if (payload.back() != '\n') {
+        payload += "\r\n";
+    }
+
+    DWORD written = 0;
+    const BOOL ok = WriteFile(stdin_write, payload.data(), static_cast<DWORD>(payload.size()), &written, nullptr);
+    if (!ok) {
+        logger.info("watchdog", "failed to write auto input to child process.", true);
+        return false;
+    }
+
+    FlushFileBuffers(stdin_write);
+    logger.info("watchdog", "sent auto input: " + shorten_for_log(text));
+    return true;
+}
+
+std::string render_template(std::string text, const std::string& reason, const std::string& transcript) {
+    replace_all(text, "{reason}", reason);
+    replace_all(text, "{transcript}", transcript.empty() ? "(no transcript captured)" : transcript);
+    return text;
+}
+
+fs::path write_context_file(const fs::path& log_dir, const std::string& reason, const std::string& transcript) {
+    fs::create_directories(log_dir);
+    const auto path = log_dir / ("decision-context-" + compact_timestamp() + ".txt");
+    std::ofstream output(path, std::ios::binary);
+    output << "reason: " << reason << "\n\n";
+    output << transcript << "\n";
+    return path;
+}
+
+std::optional<std::string> run_external_decider(const Config& config,
+                                                const std::string& reason,
+                                                const std::string& transcript,
+                                                const fs::path& log_dir,
+                                                Logger& logger) {
+    if (config.external_command.empty()) {
+        logger.info("decider", "decision_mode=external but external_command is empty; falling back.", true);
+        return std::nullopt;
+    }
+
+    auto command_line = config.external_command;
+    const auto context_file = write_context_file(log_dir, reason, transcript);
+    replace_all(command_line, "{context_file}", context_file.u8string());
+    replace_all(command_line, "{reason}", reason);
+
+    SECURITY_ATTRIBUTES security{};
+    security.nLength = sizeof(security);
+    security.bInheritHandle = TRUE;
+
+    HANDLE stdout_read = nullptr;
+    HANDLE stdout_write = nullptr;
+    if (!CreatePipe(&stdout_read, &stdout_write, &security, 0)) {
+        logger.info("decider", "CreatePipe failed while starting external decider.", true);
+        return std::nullopt;
+    }
+
+    SetHandleInformation(stdout_read, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    startup.hStdOutput = stdout_write;
+    startup.hStdError = stdout_write;
+
+    PROCESS_INFORMATION process_info{};
+    auto command_utf16 = utf8_to_wide(command_line);
+    std::vector<wchar_t> mutable_command(command_utf16.begin(), command_utf16.end());
+    mutable_command.push_back(L'\0');
+
+    const BOOL created = CreateProcessW(nullptr,
+                                        mutable_command.data(),
+                                        nullptr,
+                                        nullptr,
+                                        TRUE,
+                                        CREATE_NO_WINDOW,
+                                        nullptr,
+                                        nullptr,
+                                        &startup,
+                                        &process_info);
+
+    close_handle(stdout_write);
+
+    if (!created) {
+        close_handle(stdout_read);
+        logger.info("decider", "CreateProcessW failed while starting external decider.", true);
+        return std::nullopt;
+    }
+
+    close_handle(process_info.hThread);
+
+    std::string output;
+    const auto deadline = Clock::now() + std::chrono::seconds(config.decision_timeout_seconds);
+    bool timed_out = true;
+
+    while (Clock::now() < deadline) {
+        DWORD available = 0;
+        if (PeekNamedPipe(stdout_read, nullptr, 0, nullptr, &available, nullptr) && available > 0) {
+            std::string chunk(available, '\0');
+            DWORD read = 0;
+            if (ReadFile(stdout_read, chunk.data(), available, &read, nullptr) && read > 0) {
+                chunk.resize(read);
+                output += chunk;
+            }
+        }
+
+        const DWORD wait = WaitForSingleObject(process_info.hProcess, 100);
+        if (wait == WAIT_OBJECT_0) {
+            timed_out = false;
+            break;
+        }
+    }
+
+    DWORD remaining = 0;
+    while (PeekNamedPipe(stdout_read, nullptr, 0, nullptr, &remaining, nullptr) && remaining > 0) {
+        std::string chunk(remaining, '\0');
+        DWORD read = 0;
+        if (!ReadFile(stdout_read, chunk.data(), remaining, &read, nullptr) || read == 0) {
+            break;
+        }
+        chunk.resize(read);
+        output += chunk;
+    }
+
+    if (WaitForSingleObject(process_info.hProcess, 0) != WAIT_OBJECT_0) {
+        TerminateProcess(process_info.hProcess, 1);
+        timed_out = true;
+    }
+
+    if (timed_out) {
+        logger.info("decider", "external decider timed out; falling back.", true);
+    }
+
+    close_handle(stdout_read);
+    close_handle(process_info.hProcess);
+
+    if (timed_out) {
+        return std::nullopt;
+    }
+
+    auto trimmed = trim(output);
+    if (trimmed.empty()) {
+        logger.info("decider", "external decider returned empty output; falling back.", true);
+        return std::nullopt;
+    }
+
+    logger.info("decider", "external decider produced auto input: " + shorten_for_log(trimmed));
+    return trimmed;
+}
+
+std::string build_auto_input(const Config& config,
+                             const PendingAction& action,
+                             const SharedState& state,
+                             const fs::path& log_dir,
+                             Logger& logger) {
+    const auto transcript = state.recent_transcript();
+    if (config.decision_mode == "external") {
+        if (const auto decided = run_external_decider(config, action.reason, transcript, log_dir, logger)) {
+            return *decided;
+        }
+    }
+
+    if (action.kind == TriggerKind::RestartResume) {
+        return render_template(config.resume_template, action.reason, transcript);
+    }
+
+    return render_template(config.continue_message, action.reason, transcript);
+}
+
+void reader_loop(HANDLE pipe_handle,
+                 const std::string& source,
+                 const Config& config,
+                 SharedState& state,
+                 Logger& logger) {
+    std::string pending;
+    char buffer[2048];
+
+    while (!g_stop_requested.load()) {
+        DWORD read = 0;
+        const BOOL ok = ReadFile(pipe_handle, buffer, sizeof(buffer), &read, nullptr);
+        if (!ok || read == 0) {
+            break;
+        }
+
+        pending.append(buffer, buffer + read);
+        state.inspect_output_text(pending, config);
+
+        std::size_t position = 0;
+        while ((position = pending.find('\n')) != std::string::npos) {
+            auto line = normalize_line(pending.substr(0, position));
+            state.note_output_line(source, line);
+            logger.child_line(source, line, config.echo_output);
+            pending.erase(0, position + 1);
+        }
+    }
+
+    if (!pending.empty()) {
+        auto line = normalize_line(pending);
+        state.note_output_line(source, line);
+        logger.child_line(source, line, config.echo_output);
+    }
+
+    close_handle(pipe_handle);
+}
+
+bool launch_child(const Config& config,
+                  SharedState& state,
+                  Logger& logger,
+                  ChildProcess& child,
+                  std::thread& stdout_thread,
+                  std::thread& stderr_thread) {
+    SECURITY_ATTRIBUTES security{};
+    security.nLength = sizeof(security);
+    security.bInheritHandle = TRUE;
+
+    HANDLE stdout_read = nullptr;
+    HANDLE stdout_write = nullptr;
+    HANDLE stderr_read = nullptr;
+    HANDLE stderr_write = nullptr;
+    HANDLE stdin_read = nullptr;
+    HANDLE stdin_write = nullptr;
+
+    if (!CreatePipe(&stdout_read, &stdout_write, &security, 0) ||
+        !CreatePipe(&stderr_read, &stderr_write, &security, 0) ||
+        !CreatePipe(&stdin_read, &stdin_write, &security, 0)) {
+        close_handle(stdout_read);
+        close_handle(stdout_write);
+        close_handle(stderr_read);
+        close_handle(stderr_write);
+        close_handle(stdin_read);
+        close_handle(stdin_write);
+        logger.info("watchdog", "CreatePipe failed while starting child process.", true);
+        return false;
+    }
+
+    SetHandleInformation(stdout_read, HANDLE_FLAG_INHERIT, 0);
+    SetHandleInformation(stderr_read, HANDLE_FLAG_INHERIT, 0);
+    SetHandleInformation(stdin_write, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdInput = stdin_read;
+    startup.hStdOutput = stdout_write;
+    startup.hStdError = stderr_write;
+
+    PROCESS_INFORMATION process_info{};
+    auto command_utf16 = utf8_to_wide(config.command_line);
+    std::vector<wchar_t> mutable_command(command_utf16.begin(), command_utf16.end());
+    mutable_command.push_back(L'\0');
+    const auto workdir_utf16 = utf8_to_wide(config.workdir);
+
+    const BOOL created = CreateProcessW(nullptr,
+                                        mutable_command.data(),
+                                        nullptr,
+                                        nullptr,
+                                        TRUE,
+                                        CREATE_NO_WINDOW,
+                                        nullptr,
+                                        workdir_utf16.empty() ? nullptr : workdir_utf16.c_str(),
+                                        &startup,
+                                        &process_info);
+
+    close_handle(stdout_write);
+    close_handle(stderr_write);
+    close_handle(stdin_read);
+
+    if (!created) {
+        close_handle(stdout_read);
+        close_handle(stderr_read);
+        close_handle(stdin_write);
+        logger.info("watchdog", "CreateProcessW failed while starting child command.", true);
+        return false;
+    }
+
+    close_handle(process_info.hThread);
+
+    child.process = process_info.hProcess;
+    child.stdin_write = stdin_write;
+    child.pid = process_info.dwProcessId;
+
+    state.reset_for_new_session();
+    state.note_system_event("started child pid=" + std::to_string(child.pid));
+    logger.info("watchdog", "started child pid=" + std::to_string(child.pid));
+
+    stdout_thread = std::thread(reader_loop, stdout_read, "stdout", std::cref(config), std::ref(state), std::ref(logger));
+    stderr_thread = std::thread(reader_loop, stderr_read, "stderr", std::cref(config), std::ref(state), std::ref(logger));
+    return true;
+}
+
+void stop_child(ChildProcess& child, Logger& logger) {
+    if (child.stdin_write != nullptr) {
+        close_handle(child.stdin_write);
+    }
+
+    if (child.process == nullptr) {
+        return;
+    }
+
+    if (WaitForSingleObject(child.process, 1500) == WAIT_TIMEOUT) {
+        logger.info("watchdog", "terminating child process after shutdown request.", true);
+        TerminateProcess(child.process, 1);
+    }
+}
+
+int run_spawn_mode(const Config& config, const fs::path& log_dir, Logger& logger, SharedState& state) {
+    int restart_count = 0;
+    std::string restart_reason;
+
+    while (!g_stop_requested.load()) {
+        ChildProcess child;
+        std::thread stdout_thread;
+        std::thread stderr_thread;
+
+        if (!launch_child(config, state, logger, child, stdout_thread, stderr_thread)) {
+            return 1;
+        }
+
+        std::optional<Clock::time_point> resume_due;
+        if (!restart_reason.empty()) {
+            resume_due = Clock::now() + std::chrono::seconds(std::max(config.initial_resume_delay_seconds, 0));
+        }
+
+        while (!g_stop_requested.load()) {
+            if (resume_due && Clock::now() >= *resume_due) {
+                state.schedule_restart_resume(restart_reason);
+                resume_due.reset();
+            }
+
+            if (const auto pending = state.pop_due_action(config)) {
+                const auto text = build_auto_input(config, *pending, state, log_dir, logger);
+                if (!text.empty()) {
+                    if (send_text_to_child(child.stdin_write, text, logger)) {
+                        state.note_action_sent(*pending);
+                    }
+                }
+            }
+
+            const DWORD wait = WaitForSingleObject(child.process, 500);
+            if (wait == WAIT_OBJECT_0) {
+                break;
+            }
+            if (wait == WAIT_FAILED) {
+                logger.info("watchdog", "WaitForSingleObject failed on child process.", true);
+                g_stop_requested.store(true);
+                break;
+            }
+        }
+
+        if (g_stop_requested.load()) {
+            stop_child(child, logger);
+        }
+
+        close_handle(child.stdin_write);
+
+        if (stdout_thread.joinable()) {
+            stdout_thread.join();
+        }
+        if (stderr_thread.joinable()) {
+            stderr_thread.join();
+        }
+
+        DWORD exit_code = 0;
+        if (child.process != nullptr) {
+            GetExitCodeProcess(child.process, &exit_code);
+        }
+
+        state.note_system_event("child exited with code " + std::to_string(exit_code));
+        logger.info("watchdog", "child exited with code " + std::to_string(exit_code));
+        close_handle(child.process);
+
+        if (g_stop_requested.load()) {
+            break;
+        }
+
+        if (!config.restart_on_exit) {
+            logger.info("watchdog", "restart_on_exit=false, supervisor will stop now.");
+            break;
+        }
+
+        if (config.max_restarts >= 0 && restart_count >= config.max_restarts) {
+            logger.info("watchdog", "max_restarts reached, supervisor will stop now.", true);
+            break;
+        }
+
+        ++restart_count;
+        restart_reason = "child exited with code " + std::to_string(exit_code);
+        logger.info("watchdog",
+                    "restarting child in " + std::to_string(config.restart_delay_seconds) + " seconds. reason: " +
+                        restart_reason);
+
+        if (!sleep_with_stop(std::max(config.restart_delay_seconds, 0))) {
+            break;
+        }
+    }
+
+    return 0;
+}
+
+int run_attach_mode(const Config& config, const fs::path& log_dir, Logger& logger, SharedState& state) {
+    ComApartment apartment;
+    UiAutomationClient automation;
+    AttachSession session;
+
+    logger.info("watchdog",
+                "attach mode started. waiting for window title~\"" + config.window_title_contains +
+                    "\" class~\"" + config.window_class_contains + "\"");
+
+    while (!g_stop_requested.load()) {
+        if (session.hwnd == nullptr || !IsWindow(session.hwnd)) {
+            if (const auto found = find_target_window(config)) {
+                if (session.hwnd != found->hwnd) {
+                    session.hwnd = found->hwnd;
+                    session.title = found->title;
+                    session.class_name = found->class_name;
+                    session.last_snapshot.clear();
+                    session.missing_logged = false;
+                    state.reset_for_new_session();
+                    state.note_system_event("attached window pid=" + std::to_string(found->pid) + " title=" + found->title);
+                    logger.info("watchdog", "attached window pid=" + std::to_string(found->pid) + " title=" + found->title);
+                }
+            } else {
+                if (!session.missing_logged) {
+                    logger.info("watchdog", "target window not found yet; still waiting.");
+                    session.missing_logged = true;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(std::max(config.attach_poll_millis, 250)));
+                continue;
+            }
+        }
+
+        const auto snapshot = automation.read_visible_text(session.hwnd);
+        if (!snapshot.empty() && snapshot != session.last_snapshot) {
+            state.inspect_output_text(snapshot, config);
+            note_snapshot_lines(state, logger, config, snapshot);
+            session.last_snapshot = snapshot;
+        }
+
+        if (const auto pending = state.pop_due_action(config)) {
+            const auto text = build_auto_input(config, *pending, state, log_dir, logger);
+            if (!text.empty()) {
+                if (send_text_to_window(session.hwnd, text, logger)) {
+                    state.note_action_sent(*pending);
+                }
+            }
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(std::max(config.attach_poll_millis, 250)));
+    }
+
+    return 0;
+}
+
+BOOL WINAPI console_handler(DWORD signal) {
+    switch (signal) {
+    case CTRL_C_EVENT:
+    case CTRL_BREAK_EVENT:
+    case CTRL_CLOSE_EVENT:
+    case CTRL_SHUTDOWN_EVENT:
+        g_stop_requested.store(true);
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
+void print_usage() {
+    std::cout << "Usage: loopguard [--config path-to-ini]\n";
+}
+
+fs::path parse_config_path(int argc, char* argv[]) {
+    fs::path config_path = "examples/loopguard.ini";
+
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--help" || arg == "-h") {
+            print_usage();
+            std::exit(0);
+        }
+        if (arg == "--config" && i + 1 < argc) {
+            config_path = argv[++i];
+            continue;
+        }
+        config_path = arg;
+    }
+
+    return config_path;
+}
+
+}  // namespace
+
+int main(int argc, char* argv[]) {
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+    SetConsoleCtrlHandler(console_handler, TRUE);
+
+    try {
+        const auto config_path = parse_config_path(argc, argv);
+        const auto config = load_config(config_path);
+        const auto log_dir = path_from_utf8(config.log_dir);
+        Logger logger(log_dir / "loopguard.log");
+        SharedState state(static_cast<std::size_t>(std::max(config.transcript_keep_lines, 20)));
+
+        logger.info("watchdog", "loaded config from " + config_path.string() + " mode=" + config.mode);
+        const int exit_code = config.mode == "attach" ? run_attach_mode(config, log_dir, logger, state)
+                                                      : run_spawn_mode(config, log_dir, logger, state);
+        logger.info("watchdog", "supervisor exiting.");
+        return exit_code;
+    } catch (const std::exception& error) {
+        std::cerr << "[fatal] " << error.what() << std::endl;
+        return 1;
+    }
+}

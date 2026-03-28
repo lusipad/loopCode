@@ -1,0 +1,8 @@
+build/
+logs/
+*.exe
+*.ilk
+*.obj
+*.pdb
+*.idb
+*.vcxproj.user
