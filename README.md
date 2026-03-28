@@ -39,6 +39,7 @@
 - `[agent].command_line`：要启动的 agent 命令
 - `[agent].mode`：`spawn` 或 `attach`
 - `[agent].attach_strategy`：attach 模式下的定位策略，支持 `auto`、`process_tree`、`title_match`
+- `[agent].attach_window_scope`：attach 模式下接管一个还是多个窗口，支持 `single`、`all`
 - `[agent].target_process_names`：attach 模式下要追踪的 agent 进程名，使用 `||` 分隔
 - `[agent].terminal_process_names`：attach 模式下可作为终端祖先进程的进程名，使用 `||` 分隔
 - `[agent].attach_visible_text_contains`：attach 模式下可见文本确认关键字，使用 `||` 分隔
@@ -211,12 +212,13 @@ GitHub Actions 也会在打包前先跑这组 smoke tests，并上传 `build/tes
 .\loopguard.exe --config .\examples\loopguard-attach.ini
 ```
 
-默认 attach 示例会优先按进程树找已经运行的 `codex.exe` / `claude.exe`，再映射到对应的终端窗口。
+默认 attach 示例会优先按进程树找已经运行的 `codex.exe` / `claude.exe`，再映射到对应的终端窗口，并且会同时监督所有匹配窗口。
 
 如果你想兼容旧方式，也可以改成：
 
 ```ini
 [agent]
+attach_window_scope = single
 attach_strategy = title_match
 window_title_contains = codex
 ```

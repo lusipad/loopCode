@@ -18,6 +18,8 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <oleauto.h>
 #include <optional>
@@ -234,6 +236,12 @@ std::string shorten_for_log(std::string_view input, std::size_t max_size = 160) 
     return result;
 }
 
+std::string hex_uintptr(std::uintptr_t value) {
+    std::ostringstream builder;
+    builder << "0x" << std::hex << std::uppercase << value;
+    return builder.str();
+}
+
 std::string sanitize_name(std::string value, std::string fallback = "default") {
     for (char& ch : value) {
         const bool ok = (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
@@ -387,6 +395,7 @@ struct Config {
     int max_restarts = -1;
     int restart_delay_seconds = 10;
     std::string attach_strategy = "auto";
+    std::string attach_window_scope = "all";
     std::vector<std::string> target_process_names;
     std::vector<std::string> terminal_process_names;
     std::string window_title_contains;
@@ -426,6 +435,7 @@ Config load_config(const fs::path& path) {
     config.max_restarts = parse_int(ini.get("agent", "max_restarts", "-1"), -1);
     config.restart_delay_seconds = parse_int(ini.get("agent", "restart_delay_seconds", "10"), 10);
     config.attach_strategy = to_lower_ascii(ini.get("agent", "attach_strategy", "auto"));
+    config.attach_window_scope = to_lower_ascii(ini.get("agent", "attach_window_scope", "all"));
     config.target_process_names =
         split_patterns(ini.get("agent", "target_process_names", "codex.exe||claude.exe"));
     config.terminal_process_names =
@@ -481,6 +491,9 @@ Config load_config(const fs::path& path) {
             config.attach_strategy != "title_match") {
             throw std::runtime_error(
                 "Config key [agent] attach_strategy must be auto, process_tree, or title_match.");
+        }
+        if (config.attach_window_scope != "single" && config.attach_window_scope != "all") {
+            throw std::runtime_error("Config key [agent] attach_window_scope must be single or all.");
         }
 
         if (config.attach_strategy == "title_match" && !has_title_filters) {
@@ -874,14 +887,15 @@ struct ProcessTreeResolution {
 };
 
 struct AttachSession {
-    HWND hwnd = nullptr;
-    std::string title;
-    std::string class_name;
+    WindowInfo window;
+    SharedState state;
     std::string last_snapshot;
     bool snapshot_confirmed = false;
     std::string snapshot_confirmation_reason;
     bool unconfirmed_logged = false;
-    bool missing_logged = false;
+
+    explicit AttachSession(std::size_t keep_lines)
+        : state(keep_lines) {}
 };
 
 bool has_title_filters(const Config& config) {
@@ -1118,27 +1132,24 @@ BOOL CALLBACK enum_windows_by_pid_proc(HWND hwnd, LPARAM lparam) {
     return TRUE;
 }
 
-std::optional<WindowInfo> choose_window_match(std::vector<WindowInfo> matches, const std::string& strategy_label) {
+std::vector<WindowInfo> annotate_window_matches(std::vector<WindowInfo> matches, const std::string& strategy_label) {
     if (matches.empty()) {
-        return std::nullopt;
+        return {};
     }
 
     const HWND foreground = GetForegroundWindow();
     for (auto& match : matches) {
         if (match.hwnd == foreground) {
             match.selection_reason = strategy_label + " foreground match";
-            return match;
+        } else {
+            match.selection_reason = strategy_label + " match";
         }
     }
 
-    auto selected = matches.front();
-    if (matches.size() == 1) {
-        selected.selection_reason = strategy_label + " single match";
-    } else {
-        selected.selection_reason = strategy_label + " first of " + std::to_string(matches.size()) +
-                                    " matches; focus the desired window to disambiguate";
+    if (matches.size() == 1 && matches.front().selection_reason == strategy_label + " match") {
+        matches.front().selection_reason = strategy_label + " single match";
     }
-    return selected;
+    return matches;
 }
 
 bool try_snapshot_processes(std::unordered_map<DWORD, ProcessInfo>& processes, std::string& error) {
@@ -1211,50 +1222,71 @@ std::vector<WindowInfo> find_windows_by_pid_set(const std::unordered_set<DWORD>&
     return context.matches;
 }
 
-std::optional<WindowInfo> find_target_window_by_title_match(const Config& config) {
+std::vector<WindowInfo> find_target_windows_by_title_match(const Config& config) {
     FindWindowContext context;
     context.config = &config;
     EnumWindows(enum_windows_proc, reinterpret_cast<LPARAM>(&context));
-    return choose_window_match(std::move(context.matches), "title_match");
+    return annotate_window_matches(std::move(context.matches), "title_match");
 }
 
-std::optional<WindowInfo> find_target_window_by_process_tree(const Config& config) {
+std::vector<WindowInfo> find_target_windows_by_process_tree(const Config& config) {
     std::unordered_map<DWORD, ProcessInfo> processes;
     std::string error;
     if (!try_snapshot_processes(processes, error)) {
-        return std::nullopt;
+        return {};
     }
 
     const auto resolution =
         resolve_process_tree_candidates(processes, config.target_process_names, config.terminal_process_names);
     if (resolution.terminal_pids.empty()) {
-        return std::nullopt;
+        return {};
     }
 
     auto matches = find_windows_by_pid_set(resolution.terminal_pids);
     const auto label = "process_tree (" + std::to_string(resolution.target_pids.size()) + " target process(es), " +
                        std::to_string(matches.size()) + " terminal window match(es))";
-    return choose_window_match(std::move(matches), label);
+    return annotate_window_matches(std::move(matches), label);
 }
 
-std::optional<WindowInfo> find_target_window(const Config& config) {
+std::vector<WindowInfo> find_target_windows(const Config& config) {
     if (config.attach_strategy == "title_match") {
-        return find_target_window_by_title_match(config);
+        return find_target_windows_by_title_match(config);
     }
 
     if (config.attach_strategy == "process_tree") {
-        return find_target_window_by_process_tree(config);
+        return find_target_windows_by_process_tree(config);
     }
 
-    if (const auto found = find_target_window_by_process_tree(config)) {
+    if (auto found = find_target_windows_by_process_tree(config); !found.empty()) {
         return found;
     }
 
     if (has_title_filters(config)) {
-        return find_target_window_by_title_match(config);
+        return find_target_windows_by_title_match(config);
     }
 
-    return std::nullopt;
+    return {};
+}
+
+std::optional<WindowInfo> find_target_window(const Config& config) {
+    auto matches = find_target_windows(config);
+    if (matches.empty()) {
+        return std::nullopt;
+    }
+
+    const HWND foreground = GetForegroundWindow();
+    for (auto& match : matches) {
+        if (match.hwnd == foreground) {
+            return match;
+        }
+    }
+
+    auto selected = matches.front();
+    if (matches.size() > 1) {
+        selected.selection_reason += "; first of " + std::to_string(matches.size()) +
+                                     " matches chosen because no candidate is in the foreground";
+    }
+    return selected;
 }
 
 bool focus_window(HWND hwnd) {
@@ -1352,14 +1384,18 @@ bool send_text_to_window(HWND hwnd, const std::string& text, Logger& logger) {
     return true;
 }
 
-void note_snapshot_lines(SharedState& state, Logger& logger, const Config& config, const std::string& snapshot) {
+void note_snapshot_lines(SharedState& state,
+                         Logger& logger,
+                         const Config& config,
+                         const std::string& snapshot,
+                         const std::string& source) {
     const auto clipped = tail_lines(snapshot, 40);
     for (const auto& line : split_lines(clipped)) {
         if (trim(line).empty()) {
             continue;
         }
-        state.note_output_line("attach", line);
-        logger.child_line("attach", line, config.echo_output);
+        state.note_output_line(source, line);
+        logger.child_line(source, line, config.echo_output);
     }
 }
 
@@ -1545,6 +1581,16 @@ std::string build_auto_input(const Config& config,
     }
 
     return render_template(config.continue_message, action.reason, transcript);
+}
+
+std::string attach_window_summary(const WindowInfo& info) {
+    return "hwnd=" + hex_uintptr(reinterpret_cast<std::uintptr_t>(info.hwnd)) + " pid=" + std::to_string(info.pid) +
+           " title=" + shorten_for_log(info.title);
+}
+
+std::string attach_snapshot_source(const WindowInfo& info) {
+    return "attach hwnd=" + hex_uintptr(reinterpret_cast<std::uintptr_t>(info.hwnd)) + " pid=" +
+           std::to_string(info.pid);
 }
 
 void reader_loop(HANDLE pipe_handle,
@@ -1799,70 +1845,102 @@ int run_spawn_mode(const Config& config,
 int run_attach_mode(const Config& config, const fs::path& log_dir, Logger& logger, SharedState& state) {
     ComApartment apartment;
     UiAutomationClient automation;
-    AttachSession session;
+    std::map<HWND, std::unique_ptr<AttachSession>> sessions;
+    bool waiting_logged = false;
+    const auto keep_lines = static_cast<std::size_t>(std::max(config.transcript_keep_lines, 20));
 
     logger.info("watchdog",
                 "attach mode started. strategy=" + config.attach_strategy + " target_processes=" +
                     join_patterns(config.target_process_names) + " terminal_processes=" +
-                    join_patterns(config.terminal_process_names) + " title~\"" + config.window_title_contains +
-                    "\" class~\"" + config.window_class_contains + "\"");
+                    join_patterns(config.terminal_process_names) + " scope=" + config.attach_window_scope +
+                    " title~\"" + config.window_title_contains + "\" class~\"" + config.window_class_contains + "\"");
 
     while (!g_stop_requested.load()) {
-        if (session.hwnd == nullptr || !IsWindow(session.hwnd)) {
-            if (const auto found = find_target_window(config)) {
-                if (session.hwnd != found->hwnd) {
-                    session.hwnd = found->hwnd;
-                    session.title = found->title;
-                    session.class_name = found->class_name;
-                    session.last_snapshot.clear();
-                    session.snapshot_confirmed = false;
-                    session.snapshot_confirmation_reason.clear();
-                    session.unconfirmed_logged = false;
-                    session.missing_logged = false;
-                    state.reset_for_new_session();
-                    state.note_system_event("attached window pid=" + std::to_string(found->pid) + " title=" +
-                                            found->title + " via " + found->selection_reason);
-                    logger.info("watchdog",
-                                "attached window pid=" + std::to_string(found->pid) + " title=" + found->title +
-                                    " via " + found->selection_reason);
-                }
+        auto targets = find_target_windows(config);
+        if (config.attach_window_scope == "single" && targets.size() > 1) {
+            if (const auto selected = find_target_window(config)) {
+                targets = {*selected};
             } else {
-                if (!session.missing_logged) {
-                    logger.info("watchdog", "target window not found yet; still waiting.");
-                    session.missing_logged = true;
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(std::max(config.attach_poll_millis, 250)));
+                targets.clear();
+            }
+        }
+
+        if (targets.empty()) {
+            if (!waiting_logged) {
+                logger.info("watchdog", "target window not found yet; still waiting.");
+                waiting_logged = true;
+            }
+        } else {
+            waiting_logged = false;
+        }
+
+        std::unordered_set<HWND> active_windows;
+        for (const auto& target : targets) {
+            active_windows.insert(target.hwnd);
+
+            auto& session = sessions[target.hwnd];
+            if (!session) {
+                session = std::make_unique<AttachSession>(keep_lines);
+                session->window = target;
+                state.note_system_event("attached window " + attach_window_summary(target) + " via " + target.selection_reason);
+                logger.info("watchdog",
+                            "attached window " + attach_window_summary(target) + " via " + target.selection_reason);
+            } else {
+                session->window = target;
+            }
+        }
+
+        for (auto it = sessions.begin(); it != sessions.end();) {
+            if (!active_windows.count(it->first) || !IsWindow(it->first)) {
+                logger.info("watchdog", "detached window " + attach_window_summary(it->second->window));
+                state.note_system_event("detached window " + attach_window_summary(it->second->window));
+                it = sessions.erase(it);
                 continue;
             }
+            ++it;
         }
 
-        const auto snapshot = automation.read_visible_text(session.hwnd);
-        if (!snapshot.empty() && snapshot != session.last_snapshot) {
+        for (auto& [hwnd, session] : sessions) {
+            const auto snapshot = automation.read_visible_text(hwnd);
+            if (snapshot.empty() || snapshot == session->last_snapshot) {
+                continue;
+            }
+
             const auto confirmation_reason = attach_snapshot_confirmation_reason(snapshot, config);
             const bool confirmed = !confirmation_reason.empty();
-            if (confirmed != session.snapshot_confirmed || confirmation_reason != session.snapshot_confirmation_reason) {
+            if (confirmed != session->snapshot_confirmed ||
+                confirmation_reason != session->snapshot_confirmation_reason) {
                 if (confirmed) {
-                    logger.info("watchdog", "attach visible-text confirmation matched " + confirmation_reason);
-                } else if (!session.unconfirmed_logged) {
                     logger.info("watchdog",
-                                "attach window found, but visible text does not currently look like the target agent; "
-                                "idle auto input will stay paused.");
+                                "attach visible-text confirmation matched " + confirmation_reason + " for " +
+                                    attach_window_summary(session->window));
+                } else if (!session->unconfirmed_logged) {
+                    logger.info("watchdog",
+                                "attach window found, but visible text does not currently look like the target agent "
+                                "for " +
+                                    attach_window_summary(session->window) +
+                                    "; idle auto input will stay paused.");
                 }
             }
 
-            session.snapshot_confirmed = confirmed;
-            session.snapshot_confirmation_reason = confirmation_reason;
-            session.unconfirmed_logged = !confirmed;
-            state.inspect_output_text(snapshot, config);
-            note_snapshot_lines(state, logger, config, snapshot);
-            session.last_snapshot = snapshot;
+            session->snapshot_confirmed = confirmed;
+            session->snapshot_confirmation_reason = confirmation_reason;
+            session->unconfirmed_logged = !confirmed;
+            session->state.inspect_output_text(snapshot, config);
+            note_snapshot_lines(session->state, logger, config, snapshot, attach_snapshot_source(session->window));
+            session->last_snapshot = snapshot;
         }
 
-        if (const auto pending = state.pop_due_action(config, session.snapshot_confirmed)) {
-            const auto text = build_auto_input(config, *pending, state, log_dir, logger);
-            if (!text.empty()) {
-                if (send_text_to_window(session.hwnd, text, logger)) {
-                    state.note_action_sent(*pending);
+        for (auto& [hwnd, session] : sessions) {
+            if (const auto pending = session->state.pop_due_action(config, session->snapshot_confirmed)) {
+                const auto text = build_auto_input(config, *pending, session->state, log_dir, logger);
+                if (!text.empty()) {
+                    logger.info("watchdog",
+                                "dispatching auto input to " + attach_window_summary(session->window) +
+                                    " reason=" + pending->reason);
+                    if (send_text_to_window(hwnd, text, logger)) {
+                        session->state.note_action_sent(*pending);
+                    }
                 }
             }
         }
