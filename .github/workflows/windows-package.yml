@@ -34,6 +34,9 @@ jobs:
       - name: Build
         run: cmake --build $env:BUILD_DIR --config $env:CONFIGURATION --parallel
 
+      - name: Run Smoke Tests
+        run: .\tests\run-smoke-tests.ps1 -BuildDir $env:BUILD_DIR -Configuration $env:CONFIGURATION
+
       - name: Select Package Version
         id: vars
         run: |
@@ -56,6 +59,14 @@ jobs:
             dist/*.zip
             dist/*.sha256
           if-no-files-found: error
+
+      - name: Upload Test Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-test-output-${{ github.run_id }}
+          path: build/test-output/**
+          if-no-files-found: ignore
 
       - name: Publish Release Assets
         if: github.event_name != 'pull_request' && startsWith(github.ref, 'refs/tags/')

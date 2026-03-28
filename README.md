@@ -142,6 +142,22 @@ cl /std:c++17 /EHsc /W4 src\main.cpp /Fe:loopguard.exe
 - push 到 `main`、PR 到 `main`、手动触发时，会在 `windows-latest` 上编译并上传打包产物为 workflow artifact
 - push `v*` tag 时，会额外把 zip 和 `.sha256` 上传到 GitHub Release
 
+## 测试
+
+仓库里有一组 PowerShell smoke tests：
+
+```powershell
+.\tests\run-smoke-tests.ps1 -BuildDir build -Configuration Release
+```
+
+当前覆盖三条主链路：
+
+- 打包脚本能生成 zip 和 sha256，并且包内容完整
+- `llm-decider.ps1` 能用 mock 响应正确提取模型决策
+- session 保存与 `--resume-session` 恢复链路可用
+
+GitHub Actions 也会在打包前先跑这组 smoke tests，并上传 `build/test-output/` 作为测试工件。
+
 ## 运行
 
 默认读取 `examples/loopguard.ini`：
