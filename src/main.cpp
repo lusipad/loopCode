@@ -3,6 +3,7 @@
 
 #include <windows.h>
 #include <TlHelp32.h>
+#include <winternl.h>
 #include <Unknwn.h>
 #include <UIAutomationClient.h>
 #include <UIAutomationCoreApi.h>
@@ -260,6 +261,53 @@ std::string sanitize_name(std::string value, std::string fallback = "default") {
     }
 
     return value.empty() ? fallback : value;
+}
+
+std::string strip_exe_suffix(std::string value) {
+    const auto normalized = to_lower_ascii(value);
+    if (normalized.size() > 4 && normalized.substr(normalized.size() - 4) == ".exe") {
+        value.resize(value.size() - 4);
+    }
+    return value;
+}
+
+std::string sanitize_single_line(std::string value) {
+    replace_all(value, "\r", " ");
+    replace_all(value, "\n", " ");
+    replace_all(value, "\t", " ");
+    return trim(value);
+}
+
+std::wstring quote_windows_argument(const std::wstring& value) {
+    if (value.find_first_of(L" \t\n\v\"") == std::wstring::npos) {
+        return value;
+    }
+
+    std::wstring quoted;
+    quoted.push_back(L'"');
+    std::size_t backslashes = 0;
+    for (wchar_t ch : value) {
+        if (ch == L'\\') {
+            ++backslashes;
+            continue;
+        }
+        if (ch == L'"') {
+            quoted.append(backslashes * 2 + 1, L'\\');
+            quoted.push_back(L'"');
+            backslashes = 0;
+            continue;
+        }
+        if (backslashes > 0) {
+            quoted.append(backslashes, L'\\');
+            backslashes = 0;
+        }
+        quoted.push_back(ch);
+    }
+    if (backslashes > 0) {
+        quoted.append(backslashes * 2, L'\\');
+    }
+    quoted.push_back(L'"');
+    return quoted;
 }
 
 std::vector<std::string> split_lines(const std::string& text) {
@@ -570,6 +618,7 @@ struct PendingAction {
 struct RuntimeOptions {
     fs::path config_path = "examples/loopguard.ini";
     bool resume_last = false;
+    bool resume_all_attached = false;
     std::optional<std::string> resume_session_name;
     std::optional<std::string> self_test_name;
 };
@@ -583,6 +632,11 @@ struct SavedSessionData {
     std::string workdir;
     std::string transcript;
     std::string saved_at;
+};
+
+struct AttachInventoryEntry {
+    std::string agent_name;
+    std::string workdir;
 };
 
 class SharedState {
@@ -764,8 +818,101 @@ fs::path session_transcript_path(const Config& config, const std::string& storag
     return session_storage_root(config) / sanitize_name(storage_name) / "transcript.txt";
 }
 
+std::string effective_attach_inventory_name(const Config& config) {
+    return sanitize_name(config.session_name.empty() ? "attached-windows" : config.session_name);
+}
+
+fs::path attach_inventory_path(const Config& config) {
+    return session_storage_root(config) / "attach" / effective_attach_inventory_name(config) / "inventory.tsv";
+}
+
 bool can_persist_session(const Config& config) {
     return config.session_enabled && config.mode == "spawn" && !config.command_line.empty();
+}
+
+bool can_persist_attach_inventory(const Config& config) {
+    return config.session_enabled && config.mode == "attach";
+}
+
+void write_text_file(const fs::path& path, const std::string& content);
+
+std::vector<std::string> split_tab_fields(const std::string& line) {
+    std::vector<std::string> fields;
+    std::size_t start = 0;
+    while (start <= line.size()) {
+        const auto pos = line.find('\t', start);
+        fields.push_back(pos == std::string::npos ? line.substr(start) : line.substr(start, pos - start));
+        if (pos == std::string::npos) {
+            break;
+        }
+        start = pos + 1;
+    }
+    return fields;
+}
+
+std::string attach_inventory_signature(const std::vector<AttachInventoryEntry>& entries) {
+    std::ostringstream builder;
+    for (const auto& entry : entries) {
+        builder << sanitize_single_line(entry.agent_name) << '\t' << sanitize_single_line(entry.workdir) << '\n';
+    }
+    return builder.str();
+}
+
+void save_attach_inventory(const Config& config,
+                           const std::vector<AttachInventoryEntry>& entries,
+                           Logger& logger,
+                           const std::string& reason) {
+    if (!can_persist_attach_inventory(config)) {
+        return;
+    }
+
+    const auto path = attach_inventory_path(config);
+    std::ostringstream content;
+    content << "saved_at\t" << now_timestamp() << "\n";
+    content << "reason\t" << sanitize_single_line(reason) << "\n";
+    for (const auto& entry : entries) {
+        content << "entry\t" << sanitize_single_line(entry.agent_name) << '\t' << sanitize_single_line(entry.workdir)
+                << "\n";
+    }
+
+    write_text_file(path, content.str());
+    logger.info("session",
+                "saved attach inventory \"" + effective_attach_inventory_name(config) + "\" with " +
+                    std::to_string(entries.size()) + " entr" + (entries.size() == 1 ? "y" : "ies"));
+}
+
+std::vector<AttachInventoryEntry> load_attach_inventory(const Config& config) {
+    const auto path = attach_inventory_path(config);
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        throw std::runtime_error("No attached-window inventory found. Missing: " + path.string());
+    }
+
+    std::vector<AttachInventoryEntry> entries;
+    std::string line;
+    while (std::getline(input, line)) {
+        line = trim(strip_bom(normalize_line(line)));
+        if (line.empty()) {
+            continue;
+        }
+        const auto fields = split_tab_fields(line);
+        if (fields.size() < 3 || fields[0] != "entry") {
+            continue;
+        }
+
+        AttachInventoryEntry entry;
+        entry.agent_name = fields[1];
+        entry.workdir = fields[2];
+        if (!entry.agent_name.empty() && !entry.workdir.empty()) {
+            entries.push_back(std::move(entry));
+        }
+    }
+
+    if (entries.empty()) {
+        throw std::runtime_error("Attached-window inventory is empty: " + path.string());
+    }
+
+    return entries;
 }
 
 void write_text_file(const fs::path& path, const std::string& content) {
@@ -884,6 +1031,42 @@ struct ProcessInfo {
 struct ProcessTreeResolution {
     std::vector<DWORD> target_pids;
     std::unordered_set<DWORD> terminal_pids;
+};
+
+struct RemoteUnicodeString {
+    USHORT Length = 0;
+    USHORT MaximumLength = 0;
+    PWSTR Buffer = nullptr;
+};
+
+struct RemoteCurrentDirectory {
+    RemoteUnicodeString DosPath;
+    HANDLE Handle = nullptr;
+};
+
+struct RemoteProcessParameters {
+    ULONG MaximumLength = 0;
+    ULONG Length = 0;
+    ULONG Flags = 0;
+    ULONG DebugFlags = 0;
+    HANDLE ConsoleHandle = nullptr;
+    ULONG ConsoleFlags = 0;
+    HANDLE StandardInput = nullptr;
+    HANDLE StandardOutput = nullptr;
+    HANDLE StandardError = nullptr;
+    RemoteCurrentDirectory CurrentDirectory;
+    RemoteUnicodeString DllPath;
+    RemoteUnicodeString ImagePathName;
+    RemoteUnicodeString CommandLine;
+};
+
+struct RemotePeb {
+    BYTE Reserved1[2];
+    BYTE BeingDebugged;
+    BYTE Reserved2[1];
+    PVOID Reserved3[2];
+    PVOID Ldr;
+    RemoteProcessParameters* ProcessParameters = nullptr;
 };
 
 struct AttachSession {
@@ -1213,6 +1396,188 @@ ProcessTreeResolution resolve_process_tree_candidates(const std::unordered_map<D
     }
 
     return resolution;
+}
+
+template <typename T>
+bool read_remote_value(HANDLE process, LPCVOID address, T& value) {
+    SIZE_T bytes_read = 0;
+    return ReadProcessMemory(process, address, &value, sizeof(T), &bytes_read) && bytes_read == sizeof(T);
+}
+
+std::optional<std::string> normalize_workdir(std::string candidate) {
+    candidate = trim(candidate);
+    if (candidate.empty()) {
+        return std::nullopt;
+    }
+
+    std::error_code error;
+    fs::path path = path_from_utf8(candidate);
+    path = fs::absolute(path, error);
+    if (error) {
+        return std::nullopt;
+    }
+
+    if (fs::exists(path, error) && fs::is_regular_file(path, error)) {
+        path = path.parent_path();
+    }
+    if (error || path.empty()) {
+        return std::nullopt;
+    }
+
+    return path_to_utf8(path.lexically_normal());
+}
+
+std::optional<std::string> try_read_process_current_directory(DWORD pid) {
+    using NtQueryInformationProcessFn = NTSTATUS(NTAPI*)(HANDLE, PROCESSINFOCLASS, PVOID, ULONG, PULONG);
+
+    const auto ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (ntdll == nullptr) {
+        return std::nullopt;
+    }
+
+    const auto query_process =
+        reinterpret_cast<NtQueryInformationProcessFn>(GetProcAddress(ntdll, "NtQueryInformationProcess"));
+    if (query_process == nullptr) {
+        return std::nullopt;
+    }
+
+    HANDLE process = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+    if (process == nullptr) {
+        return std::nullopt;
+    }
+
+    PROCESS_BASIC_INFORMATION basic_info{};
+    const auto status =
+        query_process(process, ProcessBasicInformation, &basic_info, sizeof(basic_info), nullptr);
+    if (status < 0 || basic_info.PebBaseAddress == nullptr) {
+        close_handle(process);
+        return std::nullopt;
+    }
+
+    RemotePeb peb{};
+    if (!read_remote_value(process, basic_info.PebBaseAddress, peb) || peb.ProcessParameters == nullptr) {
+        close_handle(process);
+        return std::nullopt;
+    }
+
+    RemoteProcessParameters parameters{};
+    if (!read_remote_value(process, peb.ProcessParameters, parameters) ||
+        parameters.CurrentDirectory.DosPath.Buffer == nullptr || parameters.CurrentDirectory.DosPath.Length == 0) {
+        close_handle(process);
+        return std::nullopt;
+    }
+
+    std::wstring buffer(parameters.CurrentDirectory.DosPath.Length / sizeof(wchar_t), L'\0');
+    SIZE_T bytes_read = 0;
+    const bool ok = ReadProcessMemory(process,
+                                      parameters.CurrentDirectory.DosPath.Buffer,
+                                      buffer.data(),
+                                      parameters.CurrentDirectory.DosPath.Length,
+                                      &bytes_read) &&
+                    bytes_read == parameters.CurrentDirectory.DosPath.Length;
+    close_handle(process);
+    if (!ok) {
+        return std::nullopt;
+    }
+
+    return normalize_workdir(wide_to_utf8(buffer));
+}
+
+DWORD find_terminal_ancestor_pid(const std::unordered_map<DWORD, ProcessInfo>& processes,
+                                 DWORD target_pid,
+                                 const std::vector<std::string>& terminal_process_names) {
+    std::unordered_set<DWORD> visited;
+    DWORD current_pid = target_pid;
+    for (int depth = 0; current_pid != 0 && depth < 64; ++depth) {
+        if (!visited.insert(current_pid).second) {
+            break;
+        }
+
+        const auto current = processes.find(current_pid);
+        if (current == processes.end()) {
+            break;
+        }
+
+        if (process_name_matches(current->second.exe_name, terminal_process_names)) {
+            return current->second.pid;
+        }
+
+        current_pid = current->second.parent_pid;
+    }
+
+    return 0;
+}
+
+std::optional<std::string> resolve_target_workdir(const std::unordered_map<DWORD, ProcessInfo>& processes,
+                                                  DWORD target_pid,
+                                                  DWORD terminal_pid) {
+    if (const auto direct = try_read_process_current_directory(target_pid)) {
+        return direct;
+    }
+
+    std::unordered_set<DWORD> visited;
+    DWORD current_pid = target_pid;
+    for (int depth = 0; current_pid != 0 && depth < 64; ++depth) {
+        if (!visited.insert(current_pid).second) {
+            break;
+        }
+
+        const auto current = processes.find(current_pid);
+        if (current == processes.end()) {
+            break;
+        }
+
+        if (current_pid != target_pid) {
+            if (const auto current_dir = try_read_process_current_directory(current_pid)) {
+                return current_dir;
+            }
+        }
+        if (current_pid == terminal_pid) {
+            break;
+        }
+
+        current_pid = current->second.parent_pid;
+    }
+
+    return std::nullopt;
+}
+
+std::vector<AttachInventoryEntry> discover_attach_inventory_entries(const Config& config) {
+    std::unordered_map<DWORD, ProcessInfo> processes;
+    std::string error;
+    if (!try_snapshot_processes(processes, error)) {
+        return {};
+    }
+
+    std::vector<AttachInventoryEntry> entries;
+    for (const auto& [pid, info] : processes) {
+        if (!process_name_matches(info.exe_name, config.target_process_names)) {
+            continue;
+        }
+
+        const DWORD terminal_pid = find_terminal_ancestor_pid(processes, pid, config.terminal_process_names);
+        if (terminal_pid == 0) {
+            continue;
+        }
+
+        const auto workdir = resolve_target_workdir(processes, pid, terminal_pid);
+        if (!workdir) {
+            continue;
+        }
+
+        AttachInventoryEntry entry;
+        entry.agent_name = strip_exe_suffix(info.exe_name);
+        entry.workdir = *workdir;
+        entries.push_back(std::move(entry));
+    }
+
+    std::sort(entries.begin(), entries.end(), [](const AttachInventoryEntry& left, const AttachInventoryEntry& right) {
+        if (left.agent_name != right.agent_name) {
+            return left.agent_name < right.agent_name;
+        }
+        return left.workdir < right.workdir;
+    });
+    return entries;
 }
 
 std::vector<WindowInfo> find_windows_by_pid_set(const std::unordered_set<DWORD>& candidate_pids) {
@@ -1593,6 +1958,68 @@ std::string attach_snapshot_source(const WindowInfo& info) {
            std::to_string(info.pid);
 }
 
+std::string resume_command_for_agent(const std::string& agent_name) {
+    const auto normalized = to_lower_ascii(strip_exe_suffix(agent_name));
+    if (normalized == "codex") {
+        return "codex resume --last";
+    }
+    if (normalized == "claude") {
+        return "claude --continue";
+    }
+    return strip_exe_suffix(agent_name);
+}
+
+bool launch_attached_resume_entry(const AttachInventoryEntry& entry, Logger& logger) {
+    const auto workdir = normalize_workdir(entry.workdir);
+    if (!workdir) {
+        logger.info("session",
+                    "skipping attached resume for agent=" + entry.agent_name + " because workdir is invalid: " +
+                        entry.workdir,
+                    true);
+        return false;
+    }
+
+    const auto resume_command = resume_command_for_agent(entry.agent_name);
+    if (resume_command.empty()) {
+        logger.info("session", "skipping attached resume because agent command is empty.", true);
+        return false;
+    }
+
+    const auto workdir_wide = utf8_to_wide(*workdir);
+    const auto command_line = std::wstring(L"wt.exe -d ") + quote_windows_argument(workdir_wide) + L" " +
+                              utf8_to_wide(resume_command);
+    std::vector<wchar_t> mutable_command(command_line.begin(), command_line.end());
+    mutable_command.push_back(L'\0');
+
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process_info{};
+    const BOOL created = CreateProcessW(nullptr,
+                                        mutable_command.data(),
+                                        nullptr,
+                                        nullptr,
+                                        FALSE,
+                                        CREATE_NEW_CONSOLE,
+                                        nullptr,
+                                        workdir_wide.c_str(),
+                                        &startup,
+                                        &process_info);
+    if (!created) {
+        logger.info("session",
+                    "failed to launch attached resume for agent=" + entry.agent_name + " workdir=" + *workdir +
+                        " command=" + resume_command,
+                    true);
+        return false;
+    }
+
+    close_handle(process_info.hThread);
+    close_handle(process_info.hProcess);
+    logger.info("session",
+                "launched attached resume for agent=" + entry.agent_name + " workdir=" + *workdir +
+                    " command=" + resume_command);
+    return true;
+}
+
 void reader_loop(HANDLE pipe_handle,
                  const std::string& source,
                  const Config& config,
@@ -1847,6 +2274,7 @@ int run_attach_mode(const Config& config, const fs::path& log_dir, Logger& logge
     UiAutomationClient automation;
     std::map<HWND, std::unique_ptr<AttachSession>> sessions;
     bool waiting_logged = false;
+    std::string last_attach_inventory_signature;
     const auto keep_lines = static_cast<std::size_t>(std::max(config.transcript_keep_lines, 20));
 
     logger.info("watchdog",
@@ -1863,6 +2291,13 @@ int run_attach_mode(const Config& config, const fs::path& log_dir, Logger& logge
             } else {
                 targets.clear();
             }
+        }
+
+        const auto inventory_entries = discover_attach_inventory_entries(config);
+        const auto inventory_signature = attach_inventory_signature(inventory_entries);
+        if (inventory_signature != last_attach_inventory_signature) {
+            save_attach_inventory(config, inventory_entries, logger, "attach scan updated");
+            last_attach_inventory_signature = inventory_signature;
         }
 
         if (targets.empty()) {
@@ -1966,7 +2401,8 @@ BOOL WINAPI console_handler(DWORD signal) {
 
 void print_usage() {
     std::cout
-        << "Usage: loopguard [--config path-to-ini] [--resume-last | --resume-session name] [--self-test name]\n";
+        << "Usage: loopguard [--config path-to-ini] [--resume-last | --resume-session name | --resume-all-attached] "
+           "[--self-test name]\n";
 }
 
 RuntimeOptions parse_runtime_options(int argc, char* argv[]) {
@@ -1990,6 +2426,10 @@ RuntimeOptions parse_runtime_options(int argc, char* argv[]) {
             options.resume_session_name = argv[++i];
             continue;
         }
+        if (arg == "--resume-all-attached") {
+            options.resume_all_attached = true;
+            continue;
+        }
         if (arg == "--self-test" && i + 1 < argc) {
             options.self_test_name = argv[++i];
             continue;
@@ -1997,11 +2437,13 @@ RuntimeOptions parse_runtime_options(int argc, char* argv[]) {
         options.config_path = arg;
     }
 
-    if (options.resume_last && options.resume_session_name) {
-        throw std::runtime_error("Use only one of --resume-last or --resume-session.");
+    const int resume_mode_count = (options.resume_last ? 1 : 0) + (options.resume_session_name ? 1 : 0) +
+                                  (options.resume_all_attached ? 1 : 0);
+    if (resume_mode_count > 1) {
+        throw std::runtime_error("Use only one resume mode at a time.");
     }
 
-    if (options.self_test_name && (options.resume_last || options.resume_session_name)) {
+    if (options.self_test_name && (options.resume_last || options.resume_session_name || options.resume_all_attached)) {
         throw std::runtime_error("Use --self-test by itself.");
     }
 
@@ -2069,6 +2511,53 @@ bool run_attach_detection_self_test(std::string& error) {
                           error)) {
         return false;
     }
+    if (!expect_self_test(resume_command_for_agent("codex.exe") == "codex resume --last",
+                          "codex attached resume command should use codex resume --last",
+                          error)) {
+        return false;
+    }
+    if (!expect_self_test(resume_command_for_agent("claude.exe") == "claude --continue",
+                          "claude attached resume command should use claude --continue",
+                          error)) {
+        return false;
+    }
+
+    const auto temp_root = fs::temp_directory_path() / ("loopguard-selftest-" + compact_timestamp());
+    fs::create_directories(temp_root);
+
+    Config attach_config;
+    attach_config.mode = "attach";
+    attach_config.session_enabled = true;
+    attach_config.session_name = "attach-selftest";
+    attach_config.session_storage_dir = path_to_utf8(temp_root / "sessions");
+    attach_config.log_dir = path_to_utf8(temp_root / "logs");
+
+    try {
+        Logger logger(path_from_utf8(attach_config.log_dir) / "selftest.log");
+        save_attach_inventory(attach_config,
+                              {AttachInventoryEntry{"codex", "D:\\Repos\\LoopCode"},
+                               AttachInventoryEntry{"claude", "D:\\Repos\\AnotherRepo"}},
+                              logger,
+                              "self-test");
+
+        const auto loaded = load_attach_inventory(attach_config);
+        if (!expect_self_test(loaded.size() == 2, "attach inventory roundtrip should keep both entries", error)) {
+            fs::remove_all(temp_root);
+            return false;
+        }
+        if (!expect_self_test(loaded[0].agent_name == "codex" && loaded[0].workdir == "D:\\Repos\\LoopCode",
+                              "attach inventory should preserve the first entry",
+                              error)) {
+            fs::remove_all(temp_root);
+            return false;
+        }
+    } catch (const std::exception& ex) {
+        error = ex.what();
+        fs::remove_all(temp_root);
+        return false;
+    }
+
+    fs::remove_all(temp_root);
 
     return true;
 }
@@ -2127,6 +2616,21 @@ int main(int argc, char* argv[]) {
         SharedState state(static_cast<std::size_t>(std::max(config.transcript_keep_lines, 20)));
 
         logger.info("watchdog", "loaded config from " + config_path.string() + " mode=" + config.mode);
+        if (options.resume_all_attached) {
+            const auto entries = load_attach_inventory(config);
+            logger.info("session",
+                        "loaded attached-window inventory with " + std::to_string(entries.size()) + " entr" +
+                            (entries.size() == 1 ? "y" : "ies"));
+
+            int launched = 0;
+            for (const auto& entry : entries) {
+                if (launch_attached_resume_entry(entry, logger)) {
+                    ++launched;
+                }
+            }
+            logger.info("session", "launched " + std::to_string(launched) + " attached resume command(s).");
+            std::this_thread::sleep_for(std::chrono::seconds(std::max(config.initial_resume_delay_seconds, 2)));
+        }
         if (startup_resume) {
             logger.info("session", "resuming saved session in workdir=" + config.workdir);
         }

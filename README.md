@@ -14,6 +14,7 @@
 - 实时采集 `stdout/stderr`，同时落 `logs/loopguard.log`
 - 在 attach 模式下轮询可见窗口文本
 - attach 模式默认按 `codex.exe/claude.exe -> 终端进程 -> 顶层窗口` 自动找目标，不再强依赖窗口标题
+- attach 模式会尽量读取已附着 agent 进程的当前工作目录，并保存成可批量恢复的目录清单
 - 基于关键字匹配触发自动输入
 - 长时间无输出时自动补发 `继续`
 - 子进程退出后自动重启
@@ -59,6 +60,11 @@
 - `[session].enabled`：是否保存可恢复会话
 - `[session].name`：可选，自定义会话名；不填时默认取工作目录名
 - `[session].storage_dir`：会话元数据和 transcript 的落盘目录
+
+attach 模式下如果 `[session].enabled=true`，还会额外在 `sessions/attach/<name>/inventory.tsv` 保存一份“已附着窗口目录清单”。其中每条记录至少包含：
+
+- agent 类型，例如 `codex` 或 `claude`
+- 解析到的执行目录
 
 ## 外部决策器
 
@@ -214,6 +220,29 @@ GitHub Actions 也会在打包前先跑这组 smoke tests，并上传 `build/tes
 
 默认 attach 示例会优先按进程树找已经运行的 `codex.exe` / `claude.exe`，再映射到对应的终端窗口，并且会同时监督所有匹配窗口。
 
+如果你想把这些已打开的窗口目录记下来，留到下次一键全部恢复，保持：
+
+```ini
+[session]
+enabled = true
+```
+
+即可。`LoopGuard` 会在 attach 轮询时持续更新目录清单。
+
+下次直接批量恢复全部已记录窗口：
+
+```powershell
+.\loopguard.exe --config .\examples\loopguard-attach.ini --resume-all-attached
+```
+
+这条命令会：
+
+1. 读取上次保存的 attach 目录清单
+2. 对 `codex` 执行 `codex resume --last`
+3. 对 `claude` 执行 `claude --continue`
+4. 用 Windows Terminal 按对应目录重新拉起
+5. 然后继续进入 attach 监控
+
 如果你想兼容旧方式，也可以改成：
 
 ```ini
@@ -237,6 +266,6 @@ window_title_contains = codex
 - `attach` 模式现在优先依赖进程树、UI Automation 和前台输入焦点；旧版标题匹配仍可作为 fallback
 - 如果同一个 Windows Terminal 窗口里有多个 tab，`LoopGuard` 只能看到当前可见 tab 的文本，所以 idle 自动恢复会先做一次可见文本确认
 - `attach` 模式把文本发到当前光标位置，所以如果你把焦点切到别的输入框，发送位置也会偏
-- 一键 resume 当前主要面向 `spawn` 模式，`attach` 模式默认不保存可恢复会话
+- attach 模式的批量 resume 依赖能成功读取目标进程的执行目录；如果系统权限或进程状态阻止读取，就不会写入该条记录
 - 关键字匹配是 substring，不是正则
 - 没有做 GUI，只是命令行工具
