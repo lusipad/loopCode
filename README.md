@@ -136,7 +136,7 @@ cmake --build build --config Release
 如果你使用 Visual Studio Developer Command Prompt，也可以直接编：
 
 ```powershell
-cl /std:c++17 /EHsc /W4 src\main.cpp /Fe:loopguard.exe
+cl /utf-8 /std:c++17 /EHsc /W4 src\main.cpp /Fe:loopguard.exe
 ```
 
 ## 打包
@@ -173,16 +173,27 @@ GitHub Actions 也会在打包前先跑这组 smoke tests，并上传 `build/tes
 
 ## 运行
 
-默认读取 `examples/loopguard.ini`：
+直接运行 `loopguard.exe` 会进入交互菜单，默认使用 attach 配置：
 
 ```powershell
 .\loopguard.exe
 ```
 
-或者指定配置：
+菜单里支持：
+
+- 附加全部
+- 附加指定
+- 恢复全部
+- 恢复指定
+
+如果你还是想走原来的参数方式，也可以显式指定配置：
 
 ```powershell
 .\loopguard.exe --config .\examples\loopguard.ini
+```
+
+```powershell
+.\loopguard.exe --menu --config .\examples\loopguard-attach.ini
 ```
 
 如果你想直接恢复上一次保存的工作目录和上下文：

@@ -615,12 +615,21 @@ struct PendingAction {
     std::string transcript_override;
 };
 
+struct AttachInventoryEntry {
+    std::string agent_name;
+    std::string workdir;
+};
+
 struct RuntimeOptions {
     fs::path config_path = "examples/loopguard.ini";
+    bool config_explicit = false;
+    bool interactive_menu = false;
     bool resume_last = false;
     bool resume_all_attached = false;
     std::optional<std::string> resume_session_name;
     std::optional<std::string> self_test_name;
+    std::vector<std::uintptr_t> selected_attach_hwnds;
+    std::optional<std::vector<AttachInventoryEntry>> attached_resume_entries_override;
 };
 
 struct SavedSessionData {
@@ -632,11 +641,6 @@ struct SavedSessionData {
     std::string workdir;
     std::string transcript;
     std::string saved_at;
-};
-
-struct AttachInventoryEntry {
-    std::string agent_name;
-    std::string workdir;
 };
 
 class SharedState {
@@ -856,6 +860,40 @@ std::string attach_inventory_signature(const std::vector<AttachInventoryEntry>& 
         builder << sanitize_single_line(entry.agent_name) << '\t' << sanitize_single_line(entry.workdir) << '\n';
     }
     return builder.str();
+}
+
+std::string prompt_line(const std::string& prompt) {
+    std::cout << prompt;
+    std::string line;
+    std::getline(std::cin, line);
+    return trim(line);
+}
+
+std::vector<int> parse_selection_indexes(const std::string& input, int max_index) {
+    std::vector<int> indexes;
+    std::string token;
+    auto flush_token = [&]() {
+        token = trim(token);
+        if (token.empty()) {
+            return;
+        }
+        const int index = parse_int(token, -1);
+        if (index >= 1 && index <= max_index &&
+            std::find(indexes.begin(), indexes.end(), index) == indexes.end()) {
+            indexes.push_back(index);
+        }
+        token.clear();
+    };
+
+    for (char ch : input) {
+        if (ch == ',' || ch == ' ' || ch == ';') {
+            flush_token();
+            continue;
+        }
+        token.push_back(ch);
+    }
+    flush_token();
+    return indexes;
 }
 
 void save_attach_inventory(const Config& config,
@@ -1577,6 +1615,12 @@ std::vector<AttachInventoryEntry> discover_attach_inventory_entries(const Config
         }
         return left.workdir < right.workdir;
     });
+    entries.erase(std::unique(entries.begin(),
+                              entries.end(),
+                              [](const AttachInventoryEntry& left, const AttachInventoryEntry& right) {
+                                  return left.agent_name == right.agent_name && left.workdir == right.workdir;
+                              }),
+                  entries.end());
     return entries;
 }
 
@@ -1652,6 +1696,133 @@ std::optional<WindowInfo> find_target_window(const Config& config) {
                                      " matches chosen because no candidate is in the foreground";
     }
     return selected;
+}
+
+std::string attach_window_summary(const WindowInfo& info);
+
+std::vector<WindowInfo> filter_target_windows_by_hwnd(const std::vector<WindowInfo>& windows,
+                                                      const std::unordered_set<std::uintptr_t>& allowed_hwnds) {
+    if (allowed_hwnds.empty()) {
+        return windows;
+    }
+
+    std::vector<WindowInfo> filtered;
+    for (const auto& window : windows) {
+        if (allowed_hwnds.count(reinterpret_cast<std::uintptr_t>(window.hwnd))) {
+            filtered.push_back(window);
+        }
+    }
+    return filtered;
+}
+
+void print_attach_window_candidates(const std::vector<WindowInfo>& windows) {
+    std::cout << "\n当前可附加窗口:\n";
+    for (std::size_t i = 0; i < windows.size(); ++i) {
+        std::cout << "  " << (i + 1) << ". " << attach_window_summary(windows[i]) << '\n';
+    }
+}
+
+void print_attach_inventory_candidates(const std::vector<AttachInventoryEntry>& entries) {
+    std::cout << "\n当前可恢复目录:\n";
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+        std::cout << "  " << (i + 1) << ". [" << entries[i].agent_name << "] " << entries[i].workdir << '\n';
+    }
+}
+
+void apply_interactive_menu(RuntimeOptions& options, const Config& config) {
+    while (true) {
+        std::cout << "\nLoopGuard 菜单\n";
+        std::cout << "  1. 附加全部\n";
+        std::cout << "  2. 附加指定\n";
+        std::cout << "  3. 恢复\n";
+        std::cout << "  4. 退出\n";
+
+        const auto choice = prompt_line("选择操作 [1-4]: ");
+        if (choice == "1") {
+            return;
+        }
+
+        if (choice == "2") {
+            const auto windows = find_target_windows(config);
+            if (windows.empty()) {
+                std::cout << "没有发现可附加窗口。\n";
+                continue;
+            }
+
+            print_attach_window_candidates(windows);
+            const auto raw_indexes = prompt_line("输入窗口编号，可多选，用逗号分隔: ");
+            const auto indexes = parse_selection_indexes(raw_indexes, static_cast<int>(windows.size()));
+            if (indexes.empty()) {
+                std::cout << "没有选中有效窗口。\n";
+                continue;
+            }
+
+            options.selected_attach_hwnds.clear();
+            for (const int index : indexes) {
+                options.selected_attach_hwnds.push_back(
+                    reinterpret_cast<std::uintptr_t>(windows[static_cast<std::size_t>(index - 1)].hwnd));
+            }
+            return;
+        }
+
+        if (choice == "3") {
+            std::cout << "\n恢复方式\n";
+            std::cout << "  1. 恢复全部\n";
+            std::cout << "  2. 恢复指定\n";
+            std::cout << "  3. 返回\n";
+
+            const auto resume_choice = prompt_line("选择恢复方式 [1-3]: ");
+            if (resume_choice == "3") {
+                continue;
+            }
+            if (resume_choice == "1") {
+                try {
+                    const auto entries = load_attach_inventory(config);
+                    if (entries.empty()) {
+                        std::cout << "没有可恢复目录。\n";
+                        continue;
+                    }
+                } catch (const std::exception& ex) {
+                    std::cout << ex.what() << '\n';
+                    continue;
+                }
+                options.resume_all_attached = true;
+                return;
+            }
+            if (resume_choice == "2") {
+                std::vector<AttachInventoryEntry> entries;
+                try {
+                    entries = load_attach_inventory(config);
+                } catch (const std::exception& ex) {
+                    std::cout << ex.what() << '\n';
+                    continue;
+                }
+                print_attach_inventory_candidates(entries);
+                const auto raw_indexes = prompt_line("输入要恢复的编号，可多选，用逗号分隔: ");
+                const auto indexes = parse_selection_indexes(raw_indexes, static_cast<int>(entries.size()));
+                if (indexes.empty()) {
+                    std::cout << "没有选中有效目录。\n";
+                    continue;
+                }
+
+                std::vector<AttachInventoryEntry> selected_entries;
+                for (const int index : indexes) {
+                    selected_entries.push_back(entries[static_cast<std::size_t>(index - 1)]);
+                }
+                options.attached_resume_entries_override = std::move(selected_entries);
+                return;
+            }
+
+            std::cout << "无效选择。\n";
+            continue;
+        }
+
+        if (choice == "4") {
+            std::exit(0);
+        }
+
+        std::cout << "无效选择。\n";
+    }
 }
 
 bool focus_window(HWND hwnd) {
@@ -2269,13 +2440,18 @@ int run_spawn_mode(const Config& config,
     return 0;
 }
 
-int run_attach_mode(const Config& config, const fs::path& log_dir, Logger& logger, SharedState& state) {
+int run_attach_mode(const Config& config,
+                    const fs::path& log_dir,
+                    Logger& logger,
+                    SharedState& state,
+                    const std::vector<std::uintptr_t>& selected_attach_hwnds = {}) {
     ComApartment apartment;
     UiAutomationClient automation;
     std::map<HWND, std::unique_ptr<AttachSession>> sessions;
     bool waiting_logged = false;
     std::string last_attach_inventory_signature;
     const auto keep_lines = static_cast<std::size_t>(std::max(config.transcript_keep_lines, 20));
+    const std::unordered_set<std::uintptr_t> selected_hwnd_set(selected_attach_hwnds.begin(), selected_attach_hwnds.end());
 
     logger.info("watchdog",
                 "attach mode started. strategy=" + config.attach_strategy + " target_processes=" +
@@ -2284,10 +2460,15 @@ int run_attach_mode(const Config& config, const fs::path& log_dir, Logger& logge
                     " title~\"" + config.window_title_contains + "\" class~\"" + config.window_class_contains + "\"");
 
     while (!g_stop_requested.load()) {
-        auto targets = find_target_windows(config);
+        auto targets = filter_target_windows_by_hwnd(find_target_windows(config), selected_hwnd_set);
         if (config.attach_window_scope == "single" && targets.size() > 1) {
             if (const auto selected = find_target_window(config)) {
-                targets = {*selected};
+                const auto selected_hwnd = reinterpret_cast<std::uintptr_t>(selected->hwnd);
+                if (selected_hwnd_set.empty() || selected_hwnd_set.count(selected_hwnd)) {
+                    targets = {*selected};
+                } else {
+                    targets.clear();
+                }
             } else {
                 targets.clear();
             }
@@ -2402,11 +2583,14 @@ BOOL WINAPI console_handler(DWORD signal) {
 void print_usage() {
     std::cout
         << "Usage: loopguard [--config path-to-ini] [--resume-last | --resume-session name | --resume-all-attached] "
-           "[--self-test name]\n";
+           "[--menu] [--self-test name]\n";
 }
 
 RuntimeOptions parse_runtime_options(int argc, char* argv[]) {
     RuntimeOptions options;
+    if (argc <= 1) {
+        options.interactive_menu = true;
+    }
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -2414,8 +2598,13 @@ RuntimeOptions parse_runtime_options(int argc, char* argv[]) {
             print_usage();
             std::exit(0);
         }
+        if (arg == "--menu") {
+            options.interactive_menu = true;
+            continue;
+        }
         if (arg == "--config" && i + 1 < argc) {
             options.config_path = argv[++i];
+            options.config_explicit = true;
             continue;
         }
         if (arg == "--resume-last") {
@@ -2435,6 +2624,7 @@ RuntimeOptions parse_runtime_options(int argc, char* argv[]) {
             continue;
         }
         options.config_path = arg;
+        options.config_explicit = true;
     }
 
     const int resume_mode_count = (options.resume_last ? 1 : 0) + (options.resume_session_name ? 1 : 0) +
@@ -2445,6 +2635,10 @@ RuntimeOptions parse_runtime_options(int argc, char* argv[]) {
 
     if (options.self_test_name && (options.resume_last || options.resume_session_name || options.resume_all_attached)) {
         throw std::runtime_error("Use --self-test by itself.");
+    }
+
+    if (options.interactive_menu && !options.config_explicit) {
+        options.config_path = "examples/loopguard-attach.ini";
     }
 
     return options;
@@ -2590,10 +2784,16 @@ int main(int argc, char* argv[]) {
         }
         auto config_path = options.config_path;
         auto config = load_config(config_path);
+        auto runtime_options = options;
         std::optional<PendingAction> startup_resume;
 
-        if (options.resume_last || options.resume_session_name) {
-            auto saved = load_saved_session(config, options.resume_session_name, options.resume_last);
+        if (runtime_options.interactive_menu) {
+            apply_interactive_menu(runtime_options, config);
+            config.mode = "attach";
+        }
+
+        if (runtime_options.resume_last || runtime_options.resume_session_name) {
+            auto saved = load_saved_session(config, runtime_options.resume_session_name, runtime_options.resume_last);
             if (!saved.config_path.empty() && fs::exists(saved.config_path)) {
                 config_path = saved.config_path;
                 config = load_config(config_path);
@@ -2616,8 +2816,10 @@ int main(int argc, char* argv[]) {
         SharedState state(static_cast<std::size_t>(std::max(config.transcript_keep_lines, 20)));
 
         logger.info("watchdog", "loaded config from " + config_path.string() + " mode=" + config.mode);
-        if (options.resume_all_attached) {
-            const auto entries = load_attach_inventory(config);
+        if (runtime_options.resume_all_attached || runtime_options.attached_resume_entries_override) {
+            const auto entries = runtime_options.attached_resume_entries_override
+                                     ? *runtime_options.attached_resume_entries_override
+                                     : load_attach_inventory(config);
             logger.info("session",
                         "loaded attached-window inventory with " + std::to_string(entries.size()) + " entr" +
                             (entries.size() == 1 ? "y" : "ies"));
@@ -2635,7 +2837,8 @@ int main(int argc, char* argv[]) {
             logger.info("session", "resuming saved session in workdir=" + config.workdir);
         }
 
-        const int exit_code = config.mode == "attach" ? run_attach_mode(config, log_dir, logger, state)
+        const int exit_code = config.mode == "attach"
+                                  ? run_attach_mode(config, log_dir, logger, state, runtime_options.selected_attach_hwnds)
                                                       : run_spawn_mode(config, config_path, log_dir, logger, state, startup_resume);
         save_session_snapshot(config, config_path, state, logger, "loopguard exited");
         logger.info("watchdog", "supervisor exiting.");
