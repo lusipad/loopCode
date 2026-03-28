@@ -17,6 +17,7 @@
 - 长时间无输出时自动补发 `继续`
 - 子进程退出后自动重启
 - 重启后把最近 transcript 拼进 resume prompt
+- 自动保存最近一次可恢复会话，下次可一键 `resume`
 - 预留“外部决策器”接口，你可以接 PowerShell、Python 或任何大模型 API
 
 ## 目录
@@ -24,7 +25,11 @@
 - `src/main.cpp`：主程序，包含 supervisor、pipe reader、INI 解析、自动触发逻辑
 - `examples/loopguard.ini`：示例配置
 - `examples/loopguard-attach.ini`：附着已打开窗口的示例配置
+- `examples/loopguard-llm.ini`：通过大模型做恢复决策的示例配置
+- `prompts/decision-strategy.md`：策略模板，可按你的恢复策略直接改
+- `prompts/decision-user-template.txt`：用户侧 prompt 模板，可按需改占位符结构
 - `scripts/decider-example.ps1`：外部决策器示例
+- `scripts/llm-decider.ps1`：通过 OpenAI 兼容接口调用大模型的决策器
 
 ## 配置说明
 
@@ -45,6 +50,9 @@
 - `[patterns].recoverable_error`：可恢复异常关键字，使用 `||` 分隔
 - `[decision].mode`：`fixed` 或 `external`
 - `[decision].external_command`：外部决策器命令，支持 `{context_file}` 和 `{reason}` 占位符
+- `[session].enabled`：是否保存可恢复会话
+- `[session].name`：可选，自定义会话名；不填时默认取工作目录名
+- `[session].storage_dir`：会话元数据和 transcript 的落盘目录
 
 ## 外部决策器
 
@@ -64,6 +72,45 @@ external_command = powershell -ExecutionPolicy Bypass -File scripts\decider-exam
 - Claude API
 - 自己本地部署的模型
 - 任意脚本规则引擎
+
+## 大模型策略决策
+
+如果你想让 `LoopGuard` 真的调用大模型来判断“现在该不该继续、该发什么 prompt”，直接用 [loopguard-llm.ini](D:/Repos/LoopCode/examples/loopguard-llm.ini)。
+
+它默认会调用 [llm-decider.ps1](D:/Repos/LoopCode/scripts/llm-decider.ps1)，并读取两份你可以直接修改的模板：
+
+- [decision-strategy.md](D:/Repos/LoopCode/prompts/decision-strategy.md)
+- [decision-user-template.txt](D:/Repos/LoopCode/prompts/decision-user-template.txt)
+
+默认通过 OpenAI 兼容接口的 `Responses API` 风格请求发送决策，环境变量最少要配：
+
+```powershell
+$env:OPENAI_API_KEY = "your-key"
+$env:LOOPGUARD_LLM_MODEL = "your-model-id"
+```
+
+如果不是官方 OpenAI 地址，再额外配：
+
+```powershell
+$env:LOOPGUARD_LLM_BASE_URL = "https://your-endpoint/v1"
+```
+
+然后运行：
+
+```powershell
+.\loopguard.exe --config .\examples\loopguard-llm.ini
+```
+
+`llm-decider.ps1` 会把这些上下文传给模型：
+
+- `reason`
+- `workdir`
+- `session_name`
+- 最近 transcript
+
+并要求模型返回严格 JSON，再由脚本提取出最终要发给 agent 的文本。
+
+如果你只是想本地调模板、不想真的打 API，也可以给脚本传 `-MockResponseFile` 做离线测试。
 
 ## 构建
 
@@ -109,6 +156,27 @@ cl /std:c++17 /EHsc /W4 src\main.cpp /Fe:loopguard.exe
 .\loopguard.exe --config .\examples\loopguard.ini
 ```
 
+如果你想直接恢复上一次保存的工作目录和上下文：
+
+```powershell
+.\loopguard.exe --resume-last
+```
+
+如果你配置了自定义会话名，也可以按名字恢复：
+
+```powershell
+.\loopguard.exe --resume-session my-project
+```
+
+保存的会话默认在 `sessions/` 下，里面会记住：
+
+- 上次工作的目录
+- 启动 agent 用的命令
+- 原始配置文件路径
+- 最近一段 transcript
+
+这样下次恢复时，`LoopGuard` 会在原目录重新启动 agent，并自动发送一段 resume prompt。
+
 如果你是“先自己打开 `codex/claude` 再让工具接管”，用 attach 示例：
 
 1. 先手动打开 `codex` 或 `claude`
@@ -133,5 +201,6 @@ cl /std:c++17 /EHsc /W4 src\main.cpp /Fe:loopguard.exe
 - `spawn` 模式当前是 pipe 方案，不是 PTY 方案
 - `attach` 模式依赖窗口标题匹配、UI Automation 和前台输入焦点
 - `attach` 模式把文本发到当前光标位置，所以如果你把焦点切到别的输入框，发送位置也会偏
+- 一键 resume 当前主要面向 `spawn` 模式，`attach` 模式默认不保存可恢复会话
 - 关键字匹配是 substring，不是正则
 - 没有做 GUI，只是命令行工具

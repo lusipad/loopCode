@@ -1,6 +1,7 @@
 build/
 dist*/
 logs/
+sessions/
 *.exe
 *.zip
 *.sha256

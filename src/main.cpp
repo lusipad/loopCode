@@ -144,6 +144,10 @@ std::string bstr_to_utf8(BSTR value) {
     return wide_to_utf8(std::wstring(value, SysStringLen(value)));
 }
 
+std::string path_to_utf8(const fs::path& path) {
+    return wide_to_utf8(path.wstring());
+}
+
 fs::path path_from_utf8(const std::string& text) {
     return fs::path(utf8_to_wide(text));
 }
@@ -179,6 +183,26 @@ std::string shorten_for_log(std::string_view input, std::size_t max_size = 160) 
         result += "...";
     }
     return result;
+}
+
+std::string sanitize_name(std::string value, std::string fallback = "default") {
+    for (char& ch : value) {
+        const bool ok = (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                        ch == '.' || ch == '_' || ch == '-';
+        if (!ok) {
+            ch = '-';
+        }
+    }
+
+    value = trim(value);
+    while (!value.empty() && value.front() == '-') {
+        value.erase(value.begin());
+    }
+    while (!value.empty() && value.back() == '-') {
+        value.pop_back();
+    }
+
+    return value.empty() ? fallback : value;
 }
 
 std::vector<std::string> split_lines(const std::string& text) {
@@ -333,6 +357,9 @@ struct Config {
     std::vector<std::string> recoverable_error_patterns;
     std::string decision_mode = "fixed";
     std::string external_command;
+    bool session_enabled = true;
+    std::string session_name;
+    std::string session_storage_dir = "sessions";
 };
 
 Config load_config(const fs::path& path) {
@@ -371,6 +398,9 @@ Config load_config(const fs::path& path) {
 
     config.decision_mode = to_lower_ascii(ini.get("decision", "mode", "fixed"));
     config.external_command = ini.get("decision", "external_command", "");
+    config.session_enabled = parse_bool(ini.get("session", "enabled", "true"), true);
+    config.session_name = ini.get("session", "name", "");
+    config.session_storage_dir = ini.get("session", "storage_dir", "sessions");
 
     if (config.mode != "spawn" && config.mode != "attach") {
         throw std::runtime_error("Config key [agent] mode must be either spawn or attach.");
@@ -434,6 +464,24 @@ struct PendingAction {
     TriggerKind kind = TriggerKind::Continue;
     std::string reason;
     int priority = 0;
+    std::string transcript_override;
+};
+
+struct RuntimeOptions {
+    fs::path config_path = "examples/loopguard.ini";
+    bool resume_last = false;
+    std::optional<std::string> resume_session_name;
+};
+
+struct SavedSessionData {
+    std::string storage_name;
+    std::string display_name;
+    fs::path config_path;
+    std::string mode;
+    std::string command_line;
+    std::string workdir;
+    std::string transcript;
+    std::string saved_at;
 };
 
 class SharedState {
@@ -485,7 +533,12 @@ public:
 
     void schedule_restart_resume(const std::string& reason) {
         std::lock_guard<std::mutex> lock(mutex_);
-        queue_locked({TriggerKind::RestartResume, reason, 3});
+        queue_locked({TriggerKind::RestartResume, reason, 3, {}});
+    }
+
+    void schedule_resume_with_transcript(const std::string& reason, const std::string& transcript) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        queue_locked({TriggerKind::RestartResume, reason, 3, transcript});
     }
 
     std::optional<PendingAction> pop_due_action(const Config& config) {
@@ -595,6 +648,133 @@ private:
     std::optional<PendingAction> pending_;
     std::string suppressed_trigger_key_;
 };
+
+std::string effective_session_name(const Config& config) {
+    if (!config.session_name.empty()) {
+        return sanitize_name(config.session_name);
+    }
+
+    fs::path workdir_path = config.workdir.empty() ? fs::current_path() : fs::path(config.workdir);
+    std::error_code error;
+    const auto absolute = fs::absolute(workdir_path, error);
+    const auto base_name = error ? workdir_path.filename().string() : absolute.filename().string();
+    return sanitize_name(base_name.empty() ? "default" : base_name);
+}
+
+fs::path session_storage_root(const Config& config) {
+    return path_from_utf8(config.session_storage_dir);
+}
+
+fs::path session_metadata_path(const Config& config, const std::string& storage_name) {
+    return session_storage_root(config) / sanitize_name(storage_name) / "session.ini";
+}
+
+fs::path session_transcript_path(const Config& config, const std::string& storage_name) {
+    return session_storage_root(config) / sanitize_name(storage_name) / "transcript.txt";
+}
+
+bool can_persist_session(const Config& config) {
+    return config.session_enabled && config.mode == "spawn" && !config.command_line.empty();
+}
+
+void write_text_file(const fs::path& path, const std::string& content) {
+    fs::create_directories(path.parent_path());
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    if (!output) {
+        throw std::runtime_error("Unable to write file: " + path.string());
+    }
+    output << content;
+}
+
+void save_session_snapshot(const Config& config,
+                           const fs::path& config_path,
+                           const SharedState& state,
+                           Logger& logger,
+                           const std::string& reason) {
+    if (!can_persist_session(config)) {
+        return;
+    }
+
+    const auto storage_name = effective_session_name(config);
+    const auto metadata_path = session_metadata_path(config, storage_name);
+    const auto transcript_path = session_transcript_path(config, storage_name);
+    const auto resolved_workdir = fs::absolute(fs::path(config.workdir.empty() ? "." : config.workdir));
+    const auto resolved_config_path = fs::absolute(config_path);
+    const auto transcript = state.recent_transcript();
+
+    std::ostringstream metadata;
+    metadata << "[session]\n";
+    metadata << "name = " << storage_name << "\n";
+    metadata << "saved_at = " << now_timestamp() << "\n";
+    metadata << "reason = " << reason << "\n";
+    metadata << "config_path = " << path_to_utf8(resolved_config_path) << "\n";
+    metadata << "\n[agent]\n";
+    metadata << "mode = " << config.mode << "\n";
+    metadata << "command_line = " << config.command_line << "\n";
+    metadata << "workdir = " << path_to_utf8(resolved_workdir) << "\n";
+
+    write_text_file(metadata_path, metadata.str());
+    write_text_file(transcript_path, transcript);
+    write_text_file(session_storage_root(config) / "last.txt", storage_name + "\n");
+
+    logger.info("session",
+                "saved session \"" + storage_name + "\" for workdir=" + path_to_utf8(resolved_workdir) + ". reason: " + reason);
+}
+
+SavedSessionData load_saved_session(const Config& config,
+                                    const std::optional<std::string>& requested_name,
+                                    bool resume_last) {
+    std::string storage_name;
+    if (resume_last) {
+        const auto last_path = session_storage_root(config) / "last.txt";
+        std::ifstream input(last_path, std::ios::binary);
+        if (!input) {
+            throw std::runtime_error("No saved session found. Missing: " + last_path.string());
+        }
+        std::getline(input, storage_name);
+        storage_name = trim(strip_bom(storage_name));
+        if (storage_name.empty()) {
+            throw std::runtime_error("No saved session found in: " + last_path.string());
+        }
+    } else if (requested_name) {
+        storage_name = sanitize_name(*requested_name);
+    } else {
+        throw std::runtime_error("Internal error: no session name requested.");
+    }
+
+    const auto metadata_path = session_metadata_path(config, storage_name);
+    const auto transcript_path = session_transcript_path(config, storage_name);
+    const auto ini = IniFile::load(metadata_path);
+
+    SavedSessionData data;
+    data.storage_name = storage_name;
+    data.display_name = ini.get("session", "name", storage_name);
+    data.saved_at = ini.get("session", "saved_at", "");
+    data.mode = ini.get("agent", "mode", "spawn");
+    data.command_line = ini.get("agent", "command_line", "");
+    data.workdir = ini.get("agent", "workdir", ".");
+
+    const auto saved_config_path = ini.get("session", "config_path", "");
+    if (!saved_config_path.empty()) {
+        data.config_path = path_from_utf8(saved_config_path);
+    }
+
+    std::ifstream transcript_input(transcript_path, std::ios::binary);
+    if (transcript_input) {
+        std::ostringstream content;
+        content << transcript_input.rdbuf();
+        data.transcript = content.str();
+    }
+
+    if (data.mode != "spawn") {
+        throw std::runtime_error("Saved session \"" + storage_name + "\" is not resumable in spawn mode.");
+    }
+    if (data.command_line.empty()) {
+        throw std::runtime_error("Saved session \"" + storage_name + "\" is missing command_line.");
+    }
+
+    return data;
+}
 
 struct WindowInfo {
     HWND hwnd = nullptr;
@@ -973,6 +1153,9 @@ std::optional<std::string> run_external_decider(const Config& config,
     const auto context_file = write_context_file(log_dir, reason, transcript);
     replace_all(command_line, "{context_file}", context_file.u8string());
     replace_all(command_line, "{reason}", reason);
+    replace_all(command_line, "{workdir}", path_to_utf8(fs::absolute(fs::path(config.workdir.empty() ? "." : config.workdir))));
+    replace_all(command_line, "{session_name}", effective_session_name(config));
+    replace_all(command_line, "{mode}", config.mode);
 
     SECURITY_ATTRIBUTES security{};
     security.nLength = sizeof(security);
@@ -1084,7 +1267,7 @@ std::string build_auto_input(const Config& config,
                              const SharedState& state,
                              const fs::path& log_dir,
                              Logger& logger) {
-    const auto transcript = state.recent_transcript();
+    const auto transcript = action.transcript_override.empty() ? state.recent_transcript() : action.transcript_override;
     if (config.decision_mode == "external") {
         if (const auto decided = run_external_decider(config, action.reason, transcript, log_dir, logger)) {
             return *decided;
@@ -1234,9 +1417,15 @@ void stop_child(ChildProcess& child, Logger& logger) {
     }
 }
 
-int run_spawn_mode(const Config& config, const fs::path& log_dir, Logger& logger, SharedState& state) {
+int run_spawn_mode(const Config& config,
+                   const fs::path& config_path,
+                   const fs::path& log_dir,
+                   Logger& logger,
+                   SharedState& state,
+                   std::optional<PendingAction> startup_resume) {
     int restart_count = 0;
     std::string restart_reason;
+    std::optional<PendingAction> pending_startup_resume = std::move(startup_resume);
 
     while (!g_stop_requested.load()) {
         ChildProcess child;
@@ -1248,14 +1437,20 @@ int run_spawn_mode(const Config& config, const fs::path& log_dir, Logger& logger
         }
 
         std::optional<Clock::time_point> resume_due;
-        if (!restart_reason.empty()) {
+        std::optional<PendingAction> deferred_resume;
+        if (pending_startup_resume) {
+            deferred_resume = std::move(pending_startup_resume);
+            pending_startup_resume.reset();
             resume_due = Clock::now() + std::chrono::seconds(std::max(config.initial_resume_delay_seconds, 0));
         }
 
         while (!g_stop_requested.load()) {
             if (resume_due && Clock::now() >= *resume_due) {
-                state.schedule_restart_resume(restart_reason);
+                if (deferred_resume) {
+                    state.schedule_resume_with_transcript(deferred_resume->reason, deferred_resume->transcript_override);
+                }
                 resume_due.reset();
+                deferred_resume.reset();
             }
 
             if (const auto pending = state.pop_due_action(config)) {
@@ -1287,22 +1482,28 @@ int run_spawn_mode(const Config& config, const fs::path& log_dir, Logger& logger
         if (stdout_thread.joinable()) {
             stdout_thread.join();
         }
-        if (stderr_thread.joinable()) {
-            stderr_thread.join();
-        }
+            if (stderr_thread.joinable()) {
+                stderr_thread.join();
+            }
 
-        DWORD exit_code = 0;
-        if (child.process != nullptr) {
-            GetExitCodeProcess(child.process, &exit_code);
-        }
+            const auto transcript_before_exit = state.recent_transcript();
+            DWORD exit_code = 0;
+            if (child.process != nullptr) {
+                GetExitCodeProcess(child.process, &exit_code);
+            }
 
-        state.note_system_event("child exited with code " + std::to_string(exit_code));
-        logger.info("watchdog", "child exited with code " + std::to_string(exit_code));
-        close_handle(child.process);
+            state.note_system_event("child exited with code " + std::to_string(exit_code));
+            logger.info("watchdog", "child exited with code " + std::to_string(exit_code));
+            save_session_snapshot(config,
+                                  config_path,
+                                  state,
+                                  logger,
+                                  "child exited with code " + std::to_string(exit_code));
+            close_handle(child.process);
 
-        if (g_stop_requested.load()) {
-            break;
-        }
+            if (g_stop_requested.load()) {
+                break;
+            }
 
         if (!config.restart_on_exit) {
             logger.info("watchdog", "restart_on_exit=false, supervisor will stop now.");
@@ -1314,11 +1515,12 @@ int run_spawn_mode(const Config& config, const fs::path& log_dir, Logger& logger
             break;
         }
 
-        ++restart_count;
-        restart_reason = "child exited with code " + std::to_string(exit_code);
-        logger.info("watchdog",
-                    "restarting child in " + std::to_string(config.restart_delay_seconds) + " seconds. reason: " +
-                        restart_reason);
+            ++restart_count;
+            restart_reason = "child exited with code " + std::to_string(exit_code);
+            pending_startup_resume = PendingAction{TriggerKind::RestartResume, restart_reason, 3, transcript_before_exit};
+            logger.info("watchdog",
+                        "restarting child in " + std::to_string(config.restart_delay_seconds) + " seconds. reason: " +
+                            restart_reason);
 
         if (!sleep_with_stop(std::max(config.restart_delay_seconds, 0))) {
             break;
@@ -1396,11 +1598,12 @@ BOOL WINAPI console_handler(DWORD signal) {
 }
 
 void print_usage() {
-    std::cout << "Usage: loopguard [--config path-to-ini]\n";
+    std::cout
+        << "Usage: loopguard [--config path-to-ini] [--resume-last | --resume-session name]\n";
 }
 
-fs::path parse_config_path(int argc, char* argv[]) {
-    fs::path config_path = "examples/loopguard.ini";
+RuntimeOptions parse_runtime_options(int argc, char* argv[]) {
+    RuntimeOptions options;
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -1409,13 +1612,25 @@ fs::path parse_config_path(int argc, char* argv[]) {
             std::exit(0);
         }
         if (arg == "--config" && i + 1 < argc) {
-            config_path = argv[++i];
+            options.config_path = argv[++i];
             continue;
         }
-        config_path = arg;
+        if (arg == "--resume-last") {
+            options.resume_last = true;
+            continue;
+        }
+        if (arg == "--resume-session" && i + 1 < argc) {
+            options.resume_session_name = argv[++i];
+            continue;
+        }
+        options.config_path = arg;
     }
 
-    return config_path;
+    if (options.resume_last && options.resume_session_name) {
+        throw std::runtime_error("Use only one of --resume-last or --resume-session.");
+    }
+
+    return options;
 }
 
 }  // namespace
@@ -1426,15 +1641,42 @@ int main(int argc, char* argv[]) {
     SetConsoleCtrlHandler(console_handler, TRUE);
 
     try {
-        const auto config_path = parse_config_path(argc, argv);
-        const auto config = load_config(config_path);
+        const auto options = parse_runtime_options(argc, argv);
+        auto config_path = options.config_path;
+        auto config = load_config(config_path);
+        std::optional<PendingAction> startup_resume;
+
+        if (options.resume_last || options.resume_session_name) {
+            auto saved = load_saved_session(config, options.resume_session_name, options.resume_last);
+            if (!saved.config_path.empty() && fs::exists(saved.config_path)) {
+                config_path = saved.config_path;
+                config = load_config(config_path);
+            }
+
+            config.mode = "spawn";
+            config.command_line = saved.command_line;
+            config.workdir = saved.workdir;
+
+            startup_resume = PendingAction{
+                TriggerKind::RestartResume,
+                "manual resume of saved session \"" + saved.display_name + "\"",
+                3,
+                saved.transcript,
+            };
+        }
+
         const auto log_dir = path_from_utf8(config.log_dir);
         Logger logger(log_dir / "loopguard.log");
         SharedState state(static_cast<std::size_t>(std::max(config.transcript_keep_lines, 20)));
 
         logger.info("watchdog", "loaded config from " + config_path.string() + " mode=" + config.mode);
+        if (startup_resume) {
+            logger.info("session", "resuming saved session in workdir=" + config.workdir);
+        }
+
         const int exit_code = config.mode == "attach" ? run_attach_mode(config, log_dir, logger, state)
-                                                      : run_spawn_mode(config, log_dir, logger, state);
+                                                      : run_spawn_mode(config, config_path, log_dir, logger, state, startup_resume);
+        save_session_snapshot(config, config_path, state, logger, "loopguard exited");
         logger.info("watchdog", "supervisor exiting.");
         return exit_code;
     } catch (const std::exception& error) {

@@ -55,11 +55,13 @@ if (Test-Path $hashPath) {
 
 New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $stageDir "examples") | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $stageDir "prompts") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $stageDir "scripts") | Out-Null
 
 Copy-Item -Path $exePath -Destination (Join-Path $stageDir "loopguard.exe")
 Copy-Item -Path (Join-Path $repoRoot "README.md") -Destination (Join-Path $stageDir "README.md")
 Copy-Item -Recurse -Force -Path (Join-Path $repoRoot "examples\*") -Destination (Join-Path $stageDir "examples")
+Copy-Item -Recurse -Force -Path (Join-Path $repoRoot "prompts\*") -Destination (Join-Path $stageDir "prompts")
 Copy-Item -Recurse -Force -Path (Join-Path $repoRoot "scripts\*") -Destination (Join-Path $stageDir "scripts")
 
 $licensePath = Join-Path $repoRoot "LICENSE"

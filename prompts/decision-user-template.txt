@@ -1,0 +1,13 @@
+Reason:
+{reason}
+
+Session:
+{session_name}
+
+Working directory:
+{workdir}
+
+Recent transcript:
+{transcript}
+
+Decide whether LoopGuard should send a recovery prompt now.
