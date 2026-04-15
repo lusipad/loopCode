@@ -169,7 +169,20 @@ cl /utf-8 /std:c++17 /EHsc /W4 src\main.cpp /Fe:loopcode.exe
 仓库里也已经带了 GitHub Actions workflow：
 
 - push 到 `main`、PR 到 `main`、手动触发时，会在 `windows-latest` 上编译并上传打包产物为 workflow artifact
-- push `v*` tag 时，会额外把 zip 和 `.sha256` 上传到 GitHub Release
+- 如果配置了 Azure Trusted Signing，非 PR 流水线会先对 `loopcode.exe` / `loopguard.exe` 做签名，再上传 artifact 和 release 资产
+- push `v*` tag 时，会额外把 zip、`.sha256` 和裸 exe 上传到 GitHub Release；如果 tag release 没配签名参数，workflow 会直接失败，避免发布未签名资产
+
+如果你要启用 GitHub Actions 里的签名，需要先在仓库里配置：
+
+- repository secrets: `AZURE_TENANT_ID`、`AZURE_CLIENT_ID`
+- repository variables: `TRUSTED_SIGNING_ENDPOINT`、`TRUSTED_SIGNING_ACCOUNT_NAME`、`TRUSTED_SIGNING_CERTIFICATE_PROFILE_NAME`
+
+这套 workflow 按微软官方推荐方式走 OIDC：先用 `azure/login` 登录，再让 `azure/trusted-signing-action` 通过 `AzureCliCredential` 完成签名，不在 GitHub 里保存 client secret。
+
+Azure 侧至少要准备好：
+
+- 一个启用了 federated credential 的 Microsoft Entra app registration，并允许当前仓库的 GitHub Actions 通过 OIDC 登录
+- 给这个 app registration 授予目标 Trusted Signing account 上对应 certificate profile 的 `Trusted Signing Certificate Profile Signer` 角色
 
 ## 测试
 
