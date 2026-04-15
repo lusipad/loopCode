@@ -47,9 +47,43 @@ jobs:
           }
           "package_version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
+      - name: Resolve Standalone Executables
+        id: exes
+        run: |
+          $loopcodeCandidates = @(
+            (Join-Path (Join-Path $env:BUILD_DIR $env:CONFIGURATION) "loopcode.exe"),
+            (Join-Path $env:BUILD_DIR "loopcode.exe")
+          )
+          $loopguardCandidates = @(
+            (Join-Path (Join-Path $env:BUILD_DIR $env:CONFIGURATION) "loopguard.exe"),
+            (Join-Path $env:BUILD_DIR "loopguard.exe")
+          )
+
+          $loopcodeExe = $loopcodeCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          $loopguardExe = $loopguardCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+          if (-not $loopcodeExe) {
+            throw "loopcode.exe not found. Checked: $($loopcodeCandidates -join ', ')"
+          }
+          if (-not $loopguardExe) {
+            throw "loopguard.exe not found. Checked: $($loopguardCandidates -join ', ')"
+          }
+
+          "loopcode_exe=$loopcodeExe" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "loopguard_exe=$loopguardExe" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
       - name: Package
         id: package
         run: .\scripts\package.ps1 -BuildDir $env:BUILD_DIR -Configuration $env:CONFIGURATION -Version "${{ steps.vars.outputs.package_version }}" -OutputDir dist
+
+      - name: Upload Standalone Executables
+        uses: actions/upload-artifact@v4
+        with:
+          name: loopcode-${{ steps.vars.outputs.package_version }}-windows-x64-exe
+          path: |
+            ${{ steps.exes.outputs.loopcode_exe }}
+            ${{ steps.exes.outputs.loopguard_exe }}
+          if-no-files-found: error
 
       - name: Upload Package Artifact
         uses: actions/upload-artifact@v4
@@ -76,10 +110,12 @@ jobs:
           $tag = "${{ github.ref_name }}"
           $zip = "${{ steps.package.outputs.package_zip }}"
           $sha = "${{ steps.package.outputs.package_sha256 }}"
+          $loopcodeExe = "${{ steps.exes.outputs.loopcode_exe }}"
+          $loopguardExe = "${{ steps.exes.outputs.loopguard_exe }}"
 
           gh release view $tag *> $null
           if ($LASTEXITCODE -ne 0) {
-            gh release create $tag $zip $sha --verify-tag --generate-notes
+            gh release create $tag $zip $sha $loopcodeExe $loopguardExe --verify-tag --generate-notes
           } else {
-            gh release upload $tag $zip $sha --clobber
+            gh release upload $tag $zip $sha $loopcodeExe $loopguardExe --clobber
           }
