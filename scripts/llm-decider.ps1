@@ -85,6 +85,19 @@ function Normalize-Decision {
     return ""
 }
 
+function Get-FirstEnvironmentVariable {
+    param([string[]]$Names)
+
+    foreach ($name in $Names) {
+        $value = [Environment]::GetEnvironmentVariable($name)
+        if (-not [string]::IsNullOrWhiteSpace($value)) {
+            return $value
+        }
+    }
+
+    return ""
+}
+
 $resolvedContextFile = Resolve-RepoPath $ContextFile
 $resolvedStrategyFile = Resolve-RepoPath $StrategyFile
 $resolvedUserTemplateFile = Resolve-RepoPath $UserTemplateFile
@@ -115,17 +128,17 @@ if (-not [string]::IsNullOrWhiteSpace($MockResponseFile)) {
 }
 
 if ([string]::IsNullOrWhiteSpace($BaseUrl)) {
-    $BaseUrl = $env:LOOPGUARD_LLM_BASE_URL
+    $BaseUrl = Get-FirstEnvironmentVariable @("LOOPCODE_LLM_BASE_URL", "LOOPGUARD_LLM_BASE_URL")
 }
 if ([string]::IsNullOrWhiteSpace($BaseUrl)) {
     $BaseUrl = "https://api.openai.com/v1"
 }
 
 if ([string]::IsNullOrWhiteSpace($Model)) {
-    $Model = $env:LOOPGUARD_LLM_MODEL
+    $Model = Get-FirstEnvironmentVariable @("LOOPCODE_LLM_MODEL", "LOOPGUARD_LLM_MODEL")
 }
 if ([string]::IsNullOrWhiteSpace($Model)) {
-    throw "Missing model. Set -Model or LOOPGUARD_LLM_MODEL."
+    throw "Missing model. Set -Model or LOOPCODE_LLM_MODEL (fallback: LOOPGUARD_LLM_MODEL)."
 }
 
 if ([string]::IsNullOrWhiteSpace($ApiKey)) {

@@ -12,6 +12,7 @@
 
 - `loopguard.exe` 作为兼容别名
 - `examples/loopguard*.ini` 作为兼容配置文件名
+- `LOOPGUARD_LLM_*` 作为兼容环境变量名
 
 这版有两种模式：
 
@@ -38,9 +39,10 @@
 
 - `src/main.cpp`：主程序，包含 wrapper 入口、supervisor、pipe reader、INI 解析、自动触发逻辑
 - `src/loopguard_attach.inl`：attach 模式和窗口检测逻辑
-- `examples/loopguard.ini`：示例配置
-- `examples/loopguard-attach.ini`：附着已打开窗口的示例配置
-- `examples/loopguard-llm.ini`：通过大模型做恢复决策的示例配置
+- `examples/loopcode.ini`：默认示例配置
+- `examples/loopcode-attach.ini`：附着已打开窗口的示例配置
+- `examples/loopcode-llm.ini`：通过大模型做恢复决策的示例配置
+- `examples/loopguard*.ini`：兼容旧命名的同内容配置
 - `prompts/decision-strategy.md`：策略模板，可按你的恢复策略直接改
 - `prompts/decision-user-template.txt`：用户侧 prompt 模板，可按需改占位符结构
 - `scripts/decider-example.ps1`：外部决策器示例
@@ -48,7 +50,7 @@
 
 ## 配置说明
 
-核心字段在 `examples/loopguard.ini`：
+核心字段在 `examples/loopcode.ini`：
 
 - `[agent].command_line`：要启动的 agent 命令
 - `[agent].mode`：`spawn` 或 `attach`
@@ -100,7 +102,7 @@ external_command = powershell -ExecutionPolicy Bypass -File scripts\decider-exam
 
 ## 大模型策略决策
 
-如果你想让 `LoopCode` 真的调用大模型来判断“现在该不该继续、该发什么 prompt”，直接用 [loopguard-llm.ini](D:/Repos/LoopCode/examples/loopguard-llm.ini)。
+如果你想让 `LoopCode` 真的调用大模型来判断“现在该不该继续、该发什么 prompt”，直接用 [loopcode-llm.ini](D:/Repos/LoopCode/examples/loopcode-llm.ini)。
 
 它默认会调用 [llm-decider.ps1](D:/Repos/LoopCode/scripts/llm-decider.ps1)，并读取两份你可以直接修改的模板：
 
@@ -111,19 +113,19 @@ external_command = powershell -ExecutionPolicy Bypass -File scripts\decider-exam
 
 ```powershell
 $env:OPENAI_API_KEY = "your-key"
-$env:LOOPGUARD_LLM_MODEL = "your-model-id"
+$env:LOOPCODE_LLM_MODEL = "your-model-id"
 ```
 
 如果不是官方 OpenAI 地址，再额外配：
 
 ```powershell
-$env:LOOPGUARD_LLM_BASE_URL = "https://your-endpoint/v1"
+$env:LOOPCODE_LLM_BASE_URL = "https://your-endpoint/v1"
 ```
 
 然后运行：
 
 ```powershell
-.\loopcode.exe --config .\examples\loopguard-llm.ini
+.\loopcode.exe --config .\examples\loopcode-llm.ini
 ```
 
 `llm-decider.ps1` 会把这些上下文传给模型：
@@ -135,7 +137,7 @@ $env:LOOPGUARD_LLM_BASE_URL = "https://your-endpoint/v1"
 
 并要求模型返回严格 JSON，再由脚本提取出最终要发给 agent 的文本。
 
-注意：环境变量名目前仍沿用 `LOOPGUARD_LLM_*`，这是为了兼容已有脚本和配置。
+注意：脚本现在优先使用 `LOOPCODE_LLM_*`，同时继续兼容旧的 `LOOPGUARD_LLM_*`。
 
 如果你只是想本地调模板、不想真的打 API，也可以给脚本传 `-MockResponseFile` 做离线测试。
 
@@ -210,11 +212,11 @@ GitHub Actions 也会在打包前先跑这组 smoke tests，并上传 `build/tes
 如果你还是想走原来的参数方式，也可以显式指定配置：
 
 ```powershell
-.\loopcode.exe --config .\examples\loopguard.ini
+.\loopcode.exe --config .\examples\loopcode.ini
 ```
 
 ```powershell
-.\loopcode.exe --menu --config .\examples\loopguard-attach.ini
+.\loopcode.exe --menu --config .\examples\loopcode-attach.ini
 ```
 
 如果你想直接恢复上一次保存的工作目录和上下文：
@@ -243,11 +245,11 @@ GitHub Actions 也会在打包前先跑这组 smoke tests，并上传 `build/tes
 1. 先手动打开 `codex` 或 `claude`
 2. 如果你同时开了多个终端窗口，先把你想接管的那个切到前台
 3. 确认目标窗口里当前可见内容确实是 agent 对话，而不是别的 tab / shell
-4. 按需修改 `examples\loopguard-attach.ini` 里的 `target_process_names`、`terminal_process_names` 或 `attach_visible_text_contains`
+4. 按需修改 `examples\loopcode-attach.ini` 里的 `target_process_names`、`terminal_process_names` 或 `attach_visible_text_contains`
 5. 运行：
 
 ```powershell
-.\loopcode.exe --config .\examples\loopguard-attach.ini
+.\loopcode.exe --config .\examples\loopcode-attach.ini
 ```
 
 默认 attach 示例会优先按进程树找已经运行的 `codex.exe` / `claude.exe`，再映射到对应的终端窗口，并且会同时监督所有匹配窗口。
@@ -264,7 +266,7 @@ enabled = true
 下次直接批量恢复全部已记录窗口：
 
 ```powershell
-.\loopcode.exe --config .\examples\loopguard-attach.ini --resume-all-attached
+.\loopcode.exe --config .\examples\loopcode-attach.ini --resume-all-attached
 ```
 
 这条命令会：

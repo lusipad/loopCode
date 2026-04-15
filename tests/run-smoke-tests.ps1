@@ -78,7 +78,8 @@ function Test-Package {
         $entries = $zip.Entries | Select-Object -ExpandProperty FullName
         Assert-True ($entries -contains "loopcode-smoketest-windows-x64\loopcode.exe") "package should contain loopcode.exe"
         Assert-True ($entries -contains "loopcode-smoketest-windows-x64\loopguard.exe") "package should contain loopguard.exe alias"
-        Assert-True ($entries -contains "loopcode-smoketest-windows-x64\examples\loopguard-llm.ini") "package should contain llm example config"
+        Assert-True ($entries -contains "loopcode-smoketest-windows-x64\examples\loopcode-llm.ini") "package should contain llm example config"
+        Assert-True ($entries -contains "loopcode-smoketest-windows-x64\examples\loopguard-llm.ini") "package should still contain the compatibility llm example config"
         Assert-True ($entries -contains "loopcode-smoketest-windows-x64\prompts\decision-strategy.md") "package should contain prompt strategy"
         Assert-True ($entries -contains "loopcode-smoketest-windows-x64\scripts\llm-decider.ps1") "package should contain llm decider script"
     } finally {

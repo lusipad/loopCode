@@ -689,7 +689,7 @@ struct AttachInventoryEntry {
 };
 
 struct RuntimeOptions {
-    fs::path config_path = "examples/loopguard.ini";
+    fs::path config_path = "examples/loopcode.ini";
     bool config_explicit = false;
     bool interactive_menu = false;
     bool wrapper_mode = false;
@@ -1697,7 +1697,7 @@ RuntimeOptions parse_runtime_options(int argc, char* argv[]) {
     }
 
     if (options.interactive_menu && !options.config_explicit) {
-        options.config_path = "examples/loopguard-attach.ini";
+        options.config_path = "examples/loopcode-attach.ini";
     }
 
     return options;
