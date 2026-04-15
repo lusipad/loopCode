@@ -23,13 +23,15 @@ $buildRoot = Resolve-RepoPath -Path $BuildDir
 $outputRoot = Resolve-RepoPath -Path $OutputDir
 
 $exeCandidates = @(
+    (Join-Path (Join-Path $buildRoot $Configuration) "loopcode.exe"),
+    (Join-Path $buildRoot "loopcode.exe"),
     (Join-Path (Join-Path $buildRoot $Configuration) "loopguard.exe"),
     (Join-Path $buildRoot "loopguard.exe")
 )
 
 $exePath = $exeCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $exePath) {
-    throw "loopguard.exe not found. Checked: $($exeCandidates -join ', ')"
+    throw "loopcode.exe / loopguard.exe not found. Checked: $($exeCandidates -join ', ')"
 }
 
 $safeVersion = ($Version -replace '[^0-9A-Za-z._-]', '-').Trim('-')
@@ -58,6 +60,7 @@ New-Item -ItemType Directory -Force -Path (Join-Path $stageDir "examples") | Out
 New-Item -ItemType Directory -Force -Path (Join-Path $stageDir "prompts") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $stageDir "scripts") | Out-Null
 
+Copy-Item -Path $exePath -Destination (Join-Path $stageDir "loopcode.exe")
 Copy-Item -Path $exePath -Destination (Join-Path $stageDir "loopguard.exe")
 Copy-Item -Path (Join-Path $repoRoot "README.md") -Destination (Join-Path $stageDir "README.md")
 Copy-Item -Recurse -Force -Path (Join-Path $repoRoot "examples\*") -Destination (Join-Path $stageDir "examples")
