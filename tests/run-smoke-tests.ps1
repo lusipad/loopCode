@@ -39,7 +39,7 @@ function Assert-Contains {
     }
 }
 
-function Get-LoopGuardExe {
+function Get-LoopCodeExe {
     param(
         [string]$BuildRoot,
         [string]$Configuration
@@ -66,8 +66,8 @@ function Test-Package {
     $outputDir = Join-Path $TestRoot "package"
     & (Join-Path $RepoRoot "scripts\package.ps1") -BuildDir $BuildRoot -Configuration $Configuration -Version "smoketest" -OutputDir $outputDir | Out-Host
 
-    $zipPath = Join-Path $outputDir "loopguard-smoketest-windows-x64.zip"
-    $hashPath = Join-Path $outputDir "loopguard-smoketest-windows-x64.zip.sha256"
+    $zipPath = Join-Path $outputDir "loopcode-smoketest-windows-x64.zip"
+    $hashPath = Join-Path $outputDir "loopcode-smoketest-windows-x64.zip.sha256"
 
     Assert-True (Test-Path $zipPath) "package zip should exist"
     Assert-True (Test-Path $hashPath) "package checksum should exist"
@@ -76,11 +76,11 @@ function Test-Package {
     $zip = [IO.Compression.ZipFile]::OpenRead($zipPath)
     try {
         $entries = $zip.Entries | Select-Object -ExpandProperty FullName
-        Assert-True ($entries -contains "loopguard-smoketest-windows-x64\loopcode.exe") "package should contain loopcode.exe"
-        Assert-True ($entries -contains "loopguard-smoketest-windows-x64\loopguard.exe") "package should contain loopguard.exe alias"
-        Assert-True ($entries -contains "loopguard-smoketest-windows-x64\examples\loopguard-llm.ini") "package should contain llm example config"
-        Assert-True ($entries -contains "loopguard-smoketest-windows-x64\prompts\decision-strategy.md") "package should contain prompt strategy"
-        Assert-True ($entries -contains "loopguard-smoketest-windows-x64\scripts\llm-decider.ps1") "package should contain llm decider script"
+        Assert-True ($entries -contains "loopcode-smoketest-windows-x64\loopcode.exe") "package should contain loopcode.exe"
+        Assert-True ($entries -contains "loopcode-smoketest-windows-x64\loopguard.exe") "package should contain loopguard.exe alias"
+        Assert-True ($entries -contains "loopcode-smoketest-windows-x64\examples\loopguard-llm.ini") "package should contain llm example config"
+        Assert-True ($entries -contains "loopcode-smoketest-windows-x64\prompts\decision-strategy.md") "package should contain prompt strategy"
+        Assert-True ($entries -contains "loopcode-smoketest-windows-x64\scripts\llm-decider.ps1") "package should contain llm decider script"
     } finally {
         $zip.Dispose()
     }
@@ -346,7 +346,7 @@ storage_dir = $sessionRoot
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $buildRoot = Resolve-RepoPath -Path $BuildDir
-$exePath = Get-LoopGuardExe -BuildRoot $buildRoot -Configuration $Configuration
+$exePath = Get-LoopCodeExe -BuildRoot $buildRoot -Configuration $Configuration
 
 Assert-True (-not [string]::IsNullOrWhiteSpace($exePath)) "loopcode.exe or loopguard.exe should exist before smoke tests run"
 

@@ -676,7 +676,7 @@ void print_attach_inventory_candidates(const std::vector<AttachInventoryEntry>& 
 
 void apply_interactive_menu(RuntimeOptions& options, const Config& config) {
     while (true) {
-        std::cout << "\nLoopGuard 菜单\n";
+        std::cout << "\nLoopCode 菜单\n";
         std::cout << "  1. 附加全部\n";
         std::cout << "  2. 附加指定\n";
         std::cout << "  3. 恢复\n";
@@ -1139,7 +1139,7 @@ bool run_attach_detection_self_test(std::string& error) {
         return false;
     }
 
-    const auto temp_root = fs::temp_directory_path() / ("loopguard-selftest-" + compact_timestamp());
+    const auto temp_root = fs::temp_directory_path() / ("loopcode-selftest-" + compact_timestamp());
     fs::create_directories(temp_root);
 
     Config attach_config;

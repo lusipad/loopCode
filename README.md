@@ -1,17 +1,29 @@
-# LoopGuard
+# LoopCode
 
-`LoopGuard` 是一个 Windows 下的 C++ supervisor，用来盯 `codex`、`claude` 这类 agent CLI。它会持续读取输出或窗口可见文本，识别“等待你确认”“网络抖动/服务异常”“长时间无输出”这几类信号，然后自动发送一条恢复消息。
+`LoopCode` 是一个 Windows 下的 C++ wrapper + supervisor，用来托管 `codex`、`claude` 这类 agent CLI。它会持续读取输出或窗口可见文本，识别“等待你确认”“网络抖动/服务异常”“长时间无输出”这几类信号，然后自动发送一条恢复消息。
+
+当前默认路径是把自己当成 `codex` wrapper 使用：
+
+- `loopcode --yolo` 等价于 `codex --yolo`
+- 遇到可恢复异常时，先补发继续消息；再次命中后会自动发 `/new` 并带上 transcript 恢复提示
+- 如果 agent 进程真的退出，仍然走已有的 restart + resume 链路
+
+为了兼容旧用法，这个仓库暂时仍保留：
+
+- `loopguard.exe` 作为兼容别名
+- `examples/loopguard*.ini` 作为兼容配置文件名
 
 这版有两种模式：
 
-- `spawn`：由 `LoopGuard` 启动 agent 子进程，基于 stdin/stdout pipe 监控
-- `attach`：你先手动打开 agent 窗口，`LoopGuard` 再按进程树附着到对应终端窗口，用 UI Automation 读可见文本，并用 `SendInput` 回发输入
+- `spawn`：由 `LoopCode` 启动 agent 子进程，基于 stdin/stdout pipe 监控
+- `attach`：你先手动打开 agent 窗口，`LoopCode` 再按进程树附着到对应终端窗口，用 UI Automation 读可见文本，并用 `SendInput` 回发输入
 
 ## 现在已经有的能力
 
 - 监督一个子进程命令，例如 `codex` 或 `claude`
+- 默认把 `loopcode [args...]` 透传为 `codex [args...]`
 - 附着到已打开的窗口，例如已经打开的 `codex` / `claude` 所在 Windows Terminal
-- 实时采集 `stdout/stderr`，同时落 `logs/loopguard.log`
+- 实时采集 `stdout/stderr`，同时落 `logs/loopcode.log`
 - 在 attach 模式下轮询可见窗口文本
 - attach 模式默认按 `codex.exe/claude.exe -> 终端进程 -> 顶层窗口` 自动找目标，不再强依赖窗口标题
 - attach 模式会尽量读取已附着 agent 进程的当前工作目录，并保存成可批量恢复的目录清单
@@ -24,7 +36,8 @@
 
 ## 目录
 
-- `src/main.cpp`：主程序，包含 supervisor、pipe reader、INI 解析、自动触发逻辑
+- `src/main.cpp`：主程序，包含 wrapper 入口、supervisor、pipe reader、INI 解析、自动触发逻辑
+- `src/loopguard_attach.inl`：attach 模式和窗口检测逻辑
 - `examples/loopguard.ini`：示例配置
 - `examples/loopguard-attach.ini`：附着已打开窗口的示例配置
 - `examples/loopguard-llm.ini`：通过大模型做恢复决策的示例配置
@@ -76,7 +89,7 @@ mode = external
 external_command = powershell -ExecutionPolicy Bypass -File scripts\decider-example.ps1 -ContextFile "{context_file}" -Reason "{reason}"
 ```
 
-打开即可。`LoopGuard` 会把最近 transcript 写到一个上下文文件，再调用这个命令。外部脚本只需要把“要发回 agent 的文本”打印到 stdout。
+打开即可。`LoopCode` 会把最近 transcript 写到一个上下文文件，再调用这个命令。外部脚本只需要把“要发回 agent 的文本”打印到 stdout。
 
 这意味着你后面可以非常容易地接：
 
@@ -87,7 +100,7 @@ external_command = powershell -ExecutionPolicy Bypass -File scripts\decider-exam
 
 ## 大模型策略决策
 
-如果你想让 `LoopGuard` 真的调用大模型来判断“现在该不该继续、该发什么 prompt”，直接用 [loopguard-llm.ini](D:/Repos/LoopCode/examples/loopguard-llm.ini)。
+如果你想让 `LoopCode` 真的调用大模型来判断“现在该不该继续、该发什么 prompt”，直接用 [loopguard-llm.ini](D:/Repos/LoopCode/examples/loopguard-llm.ini)。
 
 它默认会调用 [llm-decider.ps1](D:/Repos/LoopCode/scripts/llm-decider.ps1)，并读取两份你可以直接修改的模板：
 
@@ -110,7 +123,7 @@ $env:LOOPGUARD_LLM_BASE_URL = "https://your-endpoint/v1"
 然后运行：
 
 ```powershell
-.\loopguard.exe --config .\examples\loopguard-llm.ini
+.\loopcode.exe --config .\examples\loopguard-llm.ini
 ```
 
 `llm-decider.ps1` 会把这些上下文传给模型：
@@ -121,6 +134,8 @@ $env:LOOPGUARD_LLM_BASE_URL = "https://your-endpoint/v1"
 - 最近 transcript
 
 并要求模型返回严格 JSON，再由脚本提取出最终要发给 agent 的文本。
+
+注意：环境变量名目前仍沿用 `LOOPGUARD_LLM_*`，这是为了兼容已有脚本和配置。
 
 如果你只是想本地调模板、不想真的打 API，也可以给脚本传 `-MockResponseFile` 做离线测试。
 
@@ -136,12 +151,12 @@ cmake --build build --config Release
 如果你使用 Visual Studio Developer Command Prompt，也可以直接编：
 
 ```powershell
-cl /utf-8 /std:c++17 /EHsc /W4 src\main.cpp /Fe:loopguard.exe
+cl /utf-8 /std:c++17 /EHsc /W4 src\main.cpp /Fe:loopcode.exe
 ```
 
 ## 打包
 
-本地打包脚本在 `scripts/package.ps1`。它会把 `loopguard.exe`、示例配置、脚本和 `README.md` 打成 zip，并额外生成一个 SHA256 文件：
+本地打包脚本在 `scripts/package.ps1`。它会把 `loopcode.exe`、兼容别名 `loopguard.exe`、示例配置、脚本和 `README.md` 打成 zip，并额外生成一个 SHA256 文件：
 
 ```powershell
 .\scripts\package.ps1 -BuildDir build -Configuration Release -Version dev
@@ -173,10 +188,16 @@ GitHub Actions 也会在打包前先跑这组 smoke tests，并上传 `build/tes
 
 ## 运行
 
-直接运行 `loopguard.exe` 会进入交互菜单，默认使用 attach 配置：
+默认直接运行 `loopcode.exe` 会像 `codex` 一样工作：
 
 ```powershell
-.\loopguard.exe
+.\loopcode.exe --yolo
+```
+
+如果你想进入 attach 交互菜单，需要显式带 `--menu`：
+
+```powershell
+.\loopcode.exe --menu
 ```
 
 菜单里支持：
@@ -189,23 +210,23 @@ GitHub Actions 也会在打包前先跑这组 smoke tests，并上传 `build/tes
 如果你还是想走原来的参数方式，也可以显式指定配置：
 
 ```powershell
-.\loopguard.exe --config .\examples\loopguard.ini
+.\loopcode.exe --config .\examples\loopguard.ini
 ```
 
 ```powershell
-.\loopguard.exe --menu --config .\examples\loopguard-attach.ini
+.\loopcode.exe --menu --config .\examples\loopguard-attach.ini
 ```
 
 如果你想直接恢复上一次保存的工作目录和上下文：
 
 ```powershell
-.\loopguard.exe --resume-last
+.\loopcode.exe --resume-last
 ```
 
 如果你配置了自定义会话名，也可以按名字恢复：
 
 ```powershell
-.\loopguard.exe --resume-session my-project
+.\loopcode.exe --resume-session my-project
 ```
 
 保存的会话默认在 `sessions/` 下，里面会记住：
@@ -215,7 +236,7 @@ GitHub Actions 也会在打包前先跑这组 smoke tests，并上传 `build/tes
 - 原始配置文件路径
 - 最近一段 transcript
 
-这样下次恢复时，`LoopGuard` 会在原目录重新启动 agent，并自动发送一段 resume prompt。
+这样下次恢复时，`LoopCode` 会在原目录重新启动 agent，并自动发送一段 resume prompt。
 
 如果你是“先自己打开 `codex/claude` 再让工具接管”，用 attach 示例：
 
@@ -226,7 +247,7 @@ GitHub Actions 也会在打包前先跑这组 smoke tests，并上传 `build/tes
 5. 运行：
 
 ```powershell
-.\loopguard.exe --config .\examples\loopguard-attach.ini
+.\loopcode.exe --config .\examples\loopguard-attach.ini
 ```
 
 默认 attach 示例会优先按进程树找已经运行的 `codex.exe` / `claude.exe`，再映射到对应的终端窗口，并且会同时监督所有匹配窗口。
@@ -238,12 +259,12 @@ GitHub Actions 也会在打包前先跑这组 smoke tests，并上传 `build/tes
 enabled = true
 ```
 
-即可。`LoopGuard` 会在 attach 轮询时持续更新目录清单。
+即可。`LoopCode` 会在 attach 轮询时持续更新目录清单。
 
 下次直接批量恢复全部已记录窗口：
 
 ```powershell
-.\loopguard.exe --config .\examples\loopguard-attach.ini --resume-all-attached
+.\loopcode.exe --config .\examples\loopguard-attach.ini --resume-all-attached
 ```
 
 这条命令会：
@@ -275,7 +296,7 @@ window_title_contains = codex
 
 - `spawn` 模式当前是 pipe 方案，不是 PTY 方案
 - `attach` 模式现在优先依赖进程树、UI Automation 和前台输入焦点；旧版标题匹配仍可作为 fallback
-- 如果同一个 Windows Terminal 窗口里有多个 tab，`LoopGuard` 只能看到当前可见 tab 的文本，所以 idle 自动恢复会先做一次可见文本确认
+- 如果同一个 Windows Terminal 窗口里有多个 tab，`LoopCode` 只能看到当前可见 tab 的文本，所以 idle 自动恢复会先做一次可见文本确认
 - `attach` 模式把文本发到当前光标位置，所以如果你把焦点切到别的输入框，发送位置也会偏
 - attach 模式的批量 resume 依赖能成功读取目标进程的执行目录；如果系统权限或进程状态阻止读取，就不会写入该条记录
 - 关键字匹配是 substring，不是正则

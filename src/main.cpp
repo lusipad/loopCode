@@ -1778,7 +1778,7 @@ int main(int argc, char* argv[]) {
         }
 
         const auto log_dir = path_from_utf8(config.log_dir);
-        Logger logger(log_dir / "loopguard.log");
+        Logger logger(log_dir / "loopcode.log");
         SharedState state(static_cast<std::size_t>(std::max(config.transcript_keep_lines, 20)));
 
         logger.info("watchdog", "loaded config from " + config_path.string() + " mode=" + config.mode);

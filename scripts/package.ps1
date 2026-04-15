@@ -39,7 +39,7 @@ if ([string]::IsNullOrWhiteSpace($safeVersion)) {
     $safeVersion = "dev"
 }
 
-$packageName = "loopguard-$safeVersion-windows-x64"
+$packageName = "loopcode-$safeVersion-windows-x64"
 $stageDir = Join-Path $outputRoot $packageName
 $zipPath = Join-Path $outputRoot "$packageName.zip"
 $hashPath = Join-Path $outputRoot "$packageName.zip.sha256"
